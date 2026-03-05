@@ -104,6 +104,7 @@ function buildClaudePrompt(task: Task): string {
 
   prompt += `\n`;
 
+  // Main instructions
   if (task.description) {
     prompt += task.description;
   } else if (task.input?.description) {
@@ -128,14 +129,22 @@ function buildClaudePrompt(task: Task): string {
     });
   }
 
+  // Git & CV-Hub CLI instructions
+  prompt += `\n\n## Git & CV-Hub Instructions\n`;
+  prompt += `You have the \`cv\` CLI (@controlvector/cv-git) available for all CV-Hub git operations.\n`;
+  prompt += `Use \`cv\` instead of raw \`git\` commands when interacting with CV-Hub repositories:\n`;
+  prompt += `  cv push                          # push to CV-Hub\n`;
+  prompt += `  cv pr create --title "..."       # create pull request\n`;
+  prompt += `  cv issue list                    # list issues\n`;
+  prompt += `  cv repo info                     # repo details\n`;
+  prompt += `\n`;
+  prompt += `For standard git operations (commit, branch, diff, log, status), use regular \`git\` commands.\n`;
   if (task.owner && task.repo) {
-    prompt += `\n\n## Git Remote Instructions\n`;
-    prompt += `This repository has a \`cvhub\` remote pointing to CV-Hub.\n`;
-    prompt += `When committing and pushing, push to the \`cvhub\` remote:\n`;
-    prompt += `  git push cvhub <branch>\n`;
-    prompt += `\n`;
-    prompt += `IMPORTANT: Use only standard \`git\` commands. Do NOT use \`cv\`, \`cva\`, or \`cv-git\` commands.\n`;
+    prompt += `\nTarget repository: ${task.owner}/${task.repo}\n`;
+    if (task.branch) prompt += `Target branch: ${task.branch}\n`;
   }
+  prompt += `\n`;
+  prompt += `IMPORTANT: Do NOT run \`cva\` commands. The \`cva\` binary is the agent daemon that launched you — calling it would cause recursion.\n`;
 
   prompt += `\n\n---\n`;
   prompt += `When complete, provide a brief summary of what you accomplished.\n`;
@@ -143,7 +152,10 @@ function buildClaudePrompt(task: Task): string {
   return prompt;
 }
 
+/** Shared reference to current child process so signal handlers can kill it */
 let _activeChild: ChildProcess | null = null;
+
+/** Signal handling state */
 let _sigintCount = 0;
 let _sigintTimer: ReturnType<typeof setTimeout> | null = null;
 let _signalHandlerInstalled = false;
@@ -188,17 +200,27 @@ function installSignalHandlers(
   });
 }
 
+// ============================================================================
+// Permission handling
+// ============================================================================
+
+/** Tools to pre-approve when --auto-approve is active */
 const ALLOWED_TOOLS = [
   'Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)',
   'Glob(*)', 'Grep(*)', 'WebFetch(*)', 'WebSearch(*)',
   'NotebookEdit(*)', 'TodoWrite(*)',
 ];
 
+/** Permission prompt patterns to detect in relay mode */
 const PERMISSION_PATTERNS = [
   /Allow .+ to .+\? \(y\/n\)/,
   /Do you want to proceed\? \(y\/n\)/,
   /\? \(y\/n\)/,
 ];
+
+// ============================================================================
+// Auto-approve mode launcher (proven, -p + --allowedTools)
+// ============================================================================
 
 async function launchAutoApproveMode(
   prompt: string,
@@ -238,6 +260,10 @@ async function launchAutoApproveMode(
   });
 }
 
+// ============================================================================
+// Relay mode launcher (interactive, permission prompts relayed to CV-Hub)
+// ============================================================================
+
 async function launchRelayMode(
   prompt: string,
   options: {
@@ -248,6 +274,7 @@ async function launchRelayMode(
   },
 ): Promise<{ exitCode: number; stderr: string }> {
   return new Promise((resolve, reject) => {
+    // Spawn Claude Code in interactive mode (no -p flag)
     const child = spawn('claude', [], {
       cwd: options.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -258,41 +285,59 @@ async function launchRelayMode(
     let stderr = '';
     let stdoutBuffer = '';
 
+    // Send the task prompt as initial input
     child.stdin?.write(prompt + '\n');
 
+    // Tee stdout to terminal while scanning for permission patterns
     child.stdout?.on('data', async (data: Buffer) => {
       const text = data.toString();
-      process.stdout.write(data);
+      process.stdout.write(data); // Tee to terminal
       stdoutBuffer += text;
 
+      // Check for permission prompts
       for (const pattern of PERMISSION_PATTERNS) {
         const match = stdoutBuffer.match(pattern);
         if (match) {
           const promptText = match[0];
-          stdoutBuffer = '';
+          stdoutBuffer = ''; // Reset buffer after match
 
           try {
+            // Log the approval request
             await sendTaskLog(
-              options.creds, options.executorId, options.taskId,
-              'info', `Permission prompt: ${promptText}`,
+              options.creds,
+              options.executorId,
+              options.taskId,
+              'info',
+              `Permission prompt: ${promptText}`,
               { prompt_text: promptText },
             );
 
+            // Create prompt on CV-Hub for user response
             const { prompt_id } = await createTaskPrompt(
-              options.creds, options.executorId, options.taskId,
-              promptText, 'approval', ['y', 'n'],
+              options.creds,
+              options.executorId,
+              options.taskId,
+              promptText,
+              'approval',
+              ['y', 'n'],
             );
 
+            // Poll for user response (2s interval, 5min timeout)
             const timeoutMs = 5 * 60 * 1000;
             const startPoll = Date.now();
             let answered = false;
 
             while (Date.now() - startPoll < timeoutMs) {
               await new Promise(r => setTimeout(r, 2000));
+
               try {
                 const { response } = await pollPromptResponse(
-                  options.creds, options.executorId, options.taskId, prompt_id,
+                  options.creds,
+                  options.executorId,
+                  options.taskId,
+                  prompt_id,
                 );
+
                 if (response !== null) {
                   const answer = response.toLowerCase().startsWith('y') ? 'y' : 'n';
                   child.stdin?.write(answer + '\n');
@@ -300,22 +345,27 @@ async function launchRelayMode(
                   console.log(chalk.gray(`  [relay] User responded: ${answer}`));
                   break;
                 }
-              } catch {}
+              } catch {
+                // Poll error — continue
+              }
             }
 
             if (!answered) {
+              // Timeout — deny
               child.stdin?.write('n\n');
               console.log(chalk.yellow(`  [relay] Prompt timed out, denying.`));
             }
           } catch (err: any) {
+            // If prompt relay fails, deny to be safe
             child.stdin?.write('n\n');
             console.log(chalk.yellow(`  [relay] Prompt relay error: ${err.message}, denying.`));
           }
 
-          break;
+          break; // Only handle one match per data chunk
         }
       }
 
+      // Keep buffer manageable (only last 2KB)
       if (stdoutBuffer.length > 2048) {
         stdoutBuffer = stdoutBuffer.slice(-1024);
       }
@@ -343,6 +393,10 @@ async function launchRelayMode(
   });
 }
 
+// ============================================================================
+// Main agent loop
+// ============================================================================
+
 async function runAgent(options: AgentOptions): Promise<void> {
   const creds = await readCredentials();
 
@@ -362,6 +416,7 @@ async function runAgent(options: AgentOptions): Promise<void> {
     process.exit(1);
   }
 
+  // Claude Code check
   try {
     execSync('claude --version', { stdio: 'pipe', timeout: 5000 });
   } catch {
@@ -370,6 +425,15 @@ async function runAgent(options: AgentOptions): Promise<void> {
     console.log(`   ${chalk.cyan('npm install -g @anthropic-ai/claude-code')}`);
     console.log();
     process.exit(1);
+  }
+
+  // cv-git check (warn, don't block)
+  try {
+    execSync('cv --version', { stdio: 'pipe', timeout: 5000 });
+  } catch {
+    console.log(chalk.yellow('!') + ' cv-git CLI not found. Claude Code will fall back to raw git commands.');
+    console.log(`  Install it: ${chalk.cyan('npm install -g @controlvector/cv-git')}`);
+    console.log();
   }
 
   const machineName = options.machine || await getMachineName();
@@ -386,11 +450,13 @@ async function runAgent(options: AgentOptions): Promise<void> {
     }
   }
 
+  // Register executor
   const executor = await withRetry(
     () => registerExecutor(creds, machineName, workingDir),
     'Executor registration',
   );
 
+  // Display banner
   const mode = options.autoApprove ? 'auto-approve' : 'relay';
   console.log();
   console.log(chalk.bold('CVA — CV-Hub Agent'));
@@ -423,6 +489,7 @@ async function runAgent(options: AgentOptions): Promise<void> {
     },
   );
 
+  // Main loop
   while (state.running) {
     try {
       const task = await withRetry(
@@ -458,8 +525,10 @@ async function executeTask(
   const startTime = Date.now();
   state.currentTaskId = task.id;
 
+  // Clear status line
   process.stdout.write('\r\x1b[K');
 
+  // Task header
   console.log(chalk.bold('┌─────────────────────────────────────────────────────────────┐'));
   console.log(chalk.bold(`│ Task: ${(task.title || '').substring(0, 53).padEnd(53)}│`));
   console.log(chalk.bold(`│ ID: ${task.id.padEnd(55)}│`));
@@ -467,6 +536,7 @@ async function executeTask(
   console.log(chalk.bold('└─────────────────────────────────────────────────────────────┘'));
   console.log();
 
+  // Mark task as running
   try {
     await startTask(creds, state.executorId, task.id);
     setTerminalTitle(`cva: ${task.title} (starting...)`);
@@ -477,6 +547,7 @@ async function executeTask(
     return;
   }
 
+  // Heartbeat timer
   const heartbeatTimer = setInterval(async () => {
     try {
       const elapsed = formatDuration(Date.now() - startTime);
@@ -485,6 +556,7 @@ async function executeTask(
     } catch {}
   }, 30_000);
 
+  // Timeout timer
   let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
   if (task.timeout_at) {
     const timeoutMs = new Date(task.timeout_at).getTime() - Date.now();
@@ -495,8 +567,10 @@ async function executeTask(
     }
   }
 
+  // Capture pre-task git state
   const preGitState = capturePreTaskState(options.workingDir);
 
+  // Verify/fix git remote
   const gitHost = (creds.CV_HUB_API || 'https://api.hub.controlvector.io')
     .replace(/^https?:\/\//, '')
     .replace(/^api\./, 'git.');
@@ -505,6 +579,7 @@ async function executeTask(
     console.log(chalk.gray(`   Git remote: ${remoteInfo.remoteName} -> ${remoteInfo.remoteUrl}`));
   }
 
+  // Build prompt and launch
   const prompt = buildClaudePrompt(task);
 
   try {
@@ -530,6 +605,7 @@ async function executeTask(
 
     console.log(chalk.gray('\n' + '-'.repeat(60)));
 
+    // Capture post-task git state
     const postGitState = capturePostTaskState(options.workingDir, preGitState);
     const payload = buildCompletionPayload(result.exitCode, preGitState, postGitState, startTime);
     const elapsed = formatDuration(Date.now() - startTime);
@@ -611,6 +687,10 @@ async function executeTask(
   console.log(chalk.cyan('Listening for tasks...'));
   console.log();
 }
+
+// ============================================================================
+// Command definition
+// ============================================================================
 
 export function agentCommand(): Command {
   const cmd = new Command('agent');
