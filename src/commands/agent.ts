@@ -35,7 +35,11 @@ import {
   markOffline,
   createTaskPrompt,
   pollPromptResponse,
+  postTaskEvent,
+  getEventResponse,
+  getRedirects,
 } from '../utils/api.js';
+import { parseClaudeCodeOutput } from '../utils/output-parser.js';
 import {
   capturePreTaskState,
   capturePostTaskState,
@@ -224,19 +228,49 @@ const PERMISSION_PATTERNS = [
 
 async function launchAutoApproveMode(
   prompt: string,
-  options: { cwd: string },
+  options: {
+    cwd: string;
+    creds?: CVHubCredentials;
+    taskId?: string;
+  },
 ): Promise<{ exitCode: number; stderr: string }> {
   return new Promise((resolve, reject) => {
     const args: string[] = ['-p', prompt, '--allowedTools', ...ALLOWED_TOOLS];
 
     const child = spawn('claude', args, {
       cwd: options.cwd,
-      stdio: ['inherit', 'inherit', 'pipe'],
+      stdio: ['inherit', 'pipe', 'pipe'],
       env: { ...process.env },
     });
 
     _activeChild = child;
     let stderr = '';
+    let lineBuffer = '';
+
+    // Tee stdout to terminal while parsing for structured markers
+    child.stdout?.on('data', (data: Buffer) => {
+      const text = data.toString();
+      process.stdout.write(data); // Always tee to terminal
+
+      // Parse line-by-line for structured markers
+      if (options.creds && options.taskId) {
+        lineBuffer += text;
+        const lines = lineBuffer.split('\n');
+        lineBuffer = lines.pop() ?? ''; // Keep incomplete last line
+
+        for (const line of lines) {
+          const event = parseClaudeCodeOutput(line);
+          if (event) {
+            // Fire-and-forget: don't block stdout processing
+            postTaskEvent(options.creds, options.taskId, {
+              event_type: event.eventType,
+              content: event.content,
+              needs_response: event.needsResponse,
+            }).catch(() => {});
+          }
+        }
+      }
+    });
 
     child.stderr?.on('data', (data: Buffer) => {
       const text = data.toString();
@@ -288,13 +322,72 @@ async function launchRelayMode(
     // Send the task prompt as initial input
     child.stdin?.write(prompt + '\n');
 
-    // Tee stdout to terminal while scanning for permission patterns
+    let lastRedirectCheck = Date.now();
+    let lineBuffer = '';
+
+    // Tee stdout to terminal while scanning for permission patterns + structured markers
     child.stdout?.on('data', async (data: Buffer) => {
       const text = data.toString();
       process.stdout.write(data); // Tee to terminal
       stdoutBuffer += text;
 
-      // Check for permission prompts
+      // Parse line-by-line for structured markers
+      lineBuffer += text;
+      const lines = lineBuffer.split('\n');
+      lineBuffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        const event = parseClaudeCodeOutput(line);
+        if (event) {
+          try {
+            const created = await postTaskEvent(options.creds, options.taskId, {
+              event_type: event.eventType,
+              content: event.content,
+              needs_response: event.needsResponse,
+            });
+
+            // If question, wait for response via task events
+            if (event.needsResponse && created?.id) {
+              console.log(chalk.gray(`  [stream] Question detected, waiting for planner response...`));
+              const response = await pollForEventResponse(
+                options.creds, options.taskId, created.id, 300_000,
+              );
+              if (response) {
+                const responseText = typeof response === 'string' ? response : JSON.stringify(response);
+                child.stdin?.write(responseText + '\n');
+                console.log(chalk.gray(`  [stream] Planner responded.`));
+              } else {
+                child.stdin?.write('[No response received within timeout. Continue with your best judgment.]\n');
+                console.log(chalk.yellow(`  [stream] Question timed out.`));
+              }
+            }
+          } catch {
+            // Non-fatal: don't block execution
+          }
+        }
+      }
+
+      // Periodic redirect check (every 10 seconds)
+      if (Date.now() - lastRedirectCheck > 10_000) {
+        try {
+          const redirects = await getRedirects(
+            options.creds, options.taskId,
+            new Date(lastRedirectCheck).toISOString(),
+          );
+          for (const redirect of redirects) {
+            const instruction = redirect.content?.instruction;
+            if (instruction) {
+              child.stdin?.write(`\n[REDIRECT FROM PLANNER]: ${instruction}\n`);
+              console.log(chalk.gray(`  [stream] Redirect received from planner.`));
+            }
+          }
+        } catch {
+          // Non-fatal
+        }
+        lastRedirectCheck = Date.now();
+      }
+
+      // Check for permission prompts (existing relay logic)
       for (const pattern of PERMISSION_PATTERNS) {
         const match = stdoutBuffer.match(pattern);
         if (match) {
@@ -302,7 +395,6 @@ async function launchRelayMode(
           stdoutBuffer = ''; // Reset buffer after match
 
           try {
-            // Log the approval request
             await sendTaskLog(
               options.creds,
               options.executorId,
@@ -312,7 +404,6 @@ async function launchRelayMode(
               { prompt_text: promptText },
             );
 
-            // Create prompt on CV-Hub for user response
             const { prompt_id } = await createTaskPrompt(
               options.creds,
               options.executorId,
@@ -322,7 +413,13 @@ async function launchRelayMode(
               ['y', 'n'],
             );
 
-            // Poll for user response (2s interval, 5min timeout)
+            // Also emit as approval_request event
+            postTaskEvent(options.creds, options.taskId, {
+              event_type: 'approval_request',
+              content: { prompt_text: promptText },
+              needs_response: true,
+            }).catch(() => {});
+
             const timeoutMs = 5 * 60 * 1000;
             const startPoll = Date.now();
             let answered = false;
@@ -351,17 +448,15 @@ async function launchRelayMode(
             }
 
             if (!answered) {
-              // Timeout — deny
               child.stdin?.write('n\n');
               console.log(chalk.yellow(`  [relay] Prompt timed out, denying.`));
             }
           } catch (err: any) {
-            // If prompt relay fails, deny to be safe
             child.stdin?.write('n\n');
             console.log(chalk.yellow(`  [relay] Prompt relay error: ${err.message}, denying.`));
           }
 
-          break; // Only handle one match per data chunk
+          break;
         }
       }
 
@@ -391,6 +486,31 @@ async function launchRelayMode(
       reject(err);
     });
   });
+}
+
+// ============================================================================
+// Event response polling
+// ============================================================================
+
+async function pollForEventResponse(
+  creds: CVHubCredentials,
+  taskId: string,
+  eventId: string,
+  timeoutMs: number,
+): Promise<unknown | null> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    await new Promise(r => setTimeout(r, 3000));
+    try {
+      const result = await getEventResponse(creds, taskId, eventId);
+      if (result.response !== null) {
+        return result.response;
+      }
+    } catch {
+      // Continue polling
+    }
+  }
+  return null;
 }
 
 // ============================================================================
@@ -593,7 +713,11 @@ async function executeTask(
     let result: { exitCode: number; stderr: string };
 
     if (options.autoApprove) {
-      result = await launchAutoApproveMode(prompt, { cwd: options.workingDir });
+      result = await launchAutoApproveMode(prompt, {
+        cwd: options.workingDir,
+        creds,
+        taskId: task.id,
+      });
     } else {
       result = await launchRelayMode(prompt, {
         cwd: options.workingDir,
@@ -614,6 +738,16 @@ async function executeTask(
       ...postGitState.filesModified,
       ...postGitState.filesDeleted,
     ];
+
+    // Emit completion event via task events
+    postTaskEvent(creds, task.id, {
+      event_type: 'completed',
+      content: {
+        exit_code: result.exitCode,
+        duration_seconds: Math.round((Date.now() - startTime) / 1000),
+        files_changed: allChangedFiles.length,
+      },
+    }).catch(() => {});
 
     if (result.exitCode === 0) {
       if (allChangedFiles.length > 0) {

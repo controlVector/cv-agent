@@ -218,6 +218,57 @@ export async function getTaskLogs(
   return data.logs || [];
 }
 
+// ============================================================================
+// Task events (structured streaming events)
+// ============================================================================
+
+export async function postTaskEvent(
+  creds: CVHubCredentials,
+  taskId: string,
+  event: {
+    event_type: string;
+    content: Record<string, unknown> | string;
+    needs_response?: boolean;
+  },
+): Promise<{ id: string; event_type: string }> {
+  const res = await apiCall(creds, 'POST', `/api/v1/tasks/${taskId}/events`, event);
+  if (!res.ok) throw new Error(`Post event failed: ${res.status}`);
+  return await res.json() as any;
+}
+
+export async function getEventResponse(
+  creds: CVHubCredentials,
+  taskId: string,
+  eventId: string,
+): Promise<{ response: unknown | null; responded_at: string | null }> {
+  const res = await apiCall(creds, 'GET', `/api/v1/tasks/${taskId}/events?after_id=&limit=200`);
+  if (!res.ok) throw new Error(`Get events failed: ${res.status}`);
+  const events = await res.json() as any[];
+  const event = events.find((e: any) => e.id === eventId);
+  return {
+    response: event?.response ?? null,
+    responded_at: event?.respondedAt ?? event?.responded_at ?? null,
+  };
+}
+
+export async function getRedirects(
+  creds: CVHubCredentials,
+  taskId: string,
+  afterTimestamp?: string,
+): Promise<Array<{ id: string; content: { instruction: string } }>> {
+  const qs = afterTimestamp ? `?after_timestamp=${encodeURIComponent(afterTimestamp)}` : '';
+  const res = await apiCall(creds, 'GET', `/api/v1/tasks/${taskId}/events${qs}`);
+  if (!res.ok) return [];
+  const events = await res.json() as any[];
+  return events
+    .filter((e: any) => (e.eventType ?? e.event_type) === 'redirect')
+    .map((e: any) => ({ id: e.id, content: e.content }));
+}
+
+// ============================================================================
+// Repository management
+// ============================================================================
+
 export async function createRepo(
   creds: CVHubCredentials,
   name: string,
