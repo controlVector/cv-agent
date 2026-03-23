@@ -234,64 +234,104 @@ async function launchAutoApproveMode(
     taskId?: string;
   },
 ): Promise<{ exitCode: number; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const args: string[] = ['-p', prompt, '--allowedTools', ...ALLOWED_TOOLS];
+  // Use a stable session ID so we can --continue if a question needs follow-up
+  const sessionId = options.taskId
+    ? options.taskId.replace(/-/g, '').slice(0, 32).padEnd(32, '0')
+      .replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5')
+    : undefined;
+  const pendingQuestionIds: string[] = [];
 
-    const child = spawn('claude', args, {
-      cwd: options.cwd,
-      stdio: ['inherit', 'pipe', 'pipe'],
-      env: { ...process.env },
-    });
+  const runOnce = (inputPrompt: string, isContinue: boolean): Promise<{ exitCode: number; stderr: string }> => {
+    return new Promise((resolve, reject) => {
+      const args: string[] = isContinue
+        ? ['-p', inputPrompt, '--continue', '--allowedTools', ...ALLOWED_TOOLS]
+        : ['-p', inputPrompt, '--allowedTools', ...ALLOWED_TOOLS];
 
-    _activeChild = child;
-    let stderr = '';
-    let lineBuffer = '';
+      if (sessionId && !isContinue) {
+        args.push('--session-id', sessionId);
+      }
 
-    // Tee stdout to terminal while parsing for structured markers
-    child.stdout?.on('data', (data: Buffer) => {
-      const text = data.toString();
-      process.stdout.write(data); // Always tee to terminal
+      const child = spawn('claude', args, {
+        cwd: options.cwd,
+        stdio: ['inherit', 'pipe', 'pipe'],
+        env: { ...process.env },
+      });
 
-      // Parse line-by-line for structured markers
-      if (options.creds && options.taskId) {
-        lineBuffer += text;
-        const lines = lineBuffer.split('\n');
-        lineBuffer = lines.pop() ?? ''; // Keep incomplete last line
+      _activeChild = child;
+      let stderr = '';
+      let lineBuffer = '';
 
-        for (const line of lines) {
-          const event = parseClaudeCodeOutput(line);
-          if (event) {
-            // Fire-and-forget: don't block stdout processing
-            postTaskEvent(options.creds, options.taskId, {
-              event_type: event.eventType,
-              content: event.content,
-              needs_response: event.needsResponse,
-            }).catch(() => {});
+      child.stdout?.on('data', (data: Buffer) => {
+        const text = data.toString();
+        process.stdout.write(data);
+
+        if (options.creds && options.taskId) {
+          lineBuffer += text;
+          const lines = lineBuffer.split('\n');
+          lineBuffer = lines.pop() ?? '';
+
+          for (const line of lines) {
+            const event = parseClaudeCodeOutput(line);
+            if (event) {
+              postTaskEvent(options.creds, options.taskId, {
+                event_type: event.eventType,
+                content: event.content,
+                needs_response: event.needsResponse,
+              }).then((created) => {
+                if (event.needsResponse && created?.id) {
+                  pendingQuestionIds.push(created.id);
+                }
+              }).catch(() => {});
+            }
           }
         }
-      }
-    });
+      });
 
-    child.stderr?.on('data', (data: Buffer) => {
-      const text = data.toString();
-      stderr += text;
-      process.stderr.write(data);
-    });
+      child.stderr?.on('data', (data: Buffer) => {
+        stderr += data.toString();
+        process.stderr.write(data);
+      });
 
-    child.on('close', (code, signal) => {
-      _activeChild = null;
-      if (signal === 'SIGKILL') {
-        resolve({ exitCode: 137, stderr });
+      child.on('close', (code, signal) => {
+        _activeChild = null;
+        resolve({ exitCode: signal === 'SIGKILL' ? 137 : (code ?? 1), stderr });
+      });
+
+      child.on('error', (err) => {
+        _activeChild = null;
+        reject(err);
+      });
+    });
+  };
+
+  // Initial run
+  let result = await runOnce(prompt, false);
+
+  // If there were unanswered questions and the task isn't aborted,
+  // attempt to continue with responses (up to 3 follow-ups)
+  if (options.creds && options.taskId && result.exitCode === 0) {
+    let followUps = 0;
+    while (pendingQuestionIds.length > 0 && followUps < 3) {
+      const questionId = pendingQuestionIds.shift()!;
+      console.log(chalk.gray(`  [auto-approve] Waiting for planner response to question...`));
+
+      const response = await pollForEventResponse(
+        options.creds, options.taskId, questionId, 300_000,
+      );
+
+      if (response) {
+        const responseText = typeof response === 'string' ? response : JSON.stringify(response);
+        console.log(chalk.gray(`  [auto-approve] Planner responded, continuing with --continue`));
+        result = await runOnce(responseText, true);
+        followUps++;
       } else {
-        resolve({ exitCode: code ?? 1, stderr });
+        console.log(chalk.yellow(`  [auto-approve] No response received, continuing without.`));
+        break;
       }
-    });
+    }
+  }
 
-    child.on('error', (err) => {
-      _activeChild = null;
-      reject(err);
-    });
-  });
+  return result;
 }
 
 // ============================================================================
