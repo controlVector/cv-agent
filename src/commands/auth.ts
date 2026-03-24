@@ -19,7 +19,7 @@ async function authLogin(opts: { token?: string; apiUrl?: string }): Promise<voi
   // Validate the token
   console.log(chalk.gray('Validating token...'));
   try {
-    const res = await fetch(`${apiUrl}/api/v1/user/me`, {
+    const res = await fetch(`${apiUrl}/api/auth/me`, {
       headers: { 'Authorization': `Bearer ${token}` },
     });
 
@@ -80,7 +80,7 @@ async function authStatus(): Promise<void> {
 
   // Verify token
   try {
-    const res = await fetch(`${apiUrl}/api/v1/user/me`, {
+    const res = await fetch(`${apiUrl}/api/auth/me`, {
       headers: { 'Authorization': `Bearer ${creds.CV_HUB_PAT}` },
     });
 
