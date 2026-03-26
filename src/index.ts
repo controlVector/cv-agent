@@ -18,7 +18,7 @@ const program = new Command();
 program
   .name('cva')
   .description('CV-Hub Agent — bridges Claude Code with CV-Hub task dispatch')
-  .version('0.1.0');
+  .version('1.0.0');
 
 program.addCommand(agentCommand());
 program.addCommand(authCommand());
