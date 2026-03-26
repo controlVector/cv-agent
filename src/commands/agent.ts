@@ -1,7 +1,7 @@
 /**
  * cva agent command
  *
- * Listens for tasks dispatched from Claude.ai via CV-Hub and executes them
+ * Listens for tasks dispatched via CV-Hub and executes them
  * with Claude Code. The agent registers as an executor, polls for tasks,
  * and reports results back.
  *
@@ -98,7 +98,7 @@ interface Task {
 
 function buildClaudePrompt(task: Task): string {
   let prompt = '';
-  prompt += `You are executing a task dispatched from Claude.ai via CV-Hub.\n\n`;
+  prompt += `You are executing a task dispatched via CV-Hub.\n\n`;
   prompt += `## Task: ${task.title}\n`;
   prompt += `Task ID: ${task.id}\n`;
   prompt += `Priority: ${task.priority}\n`;
@@ -598,7 +598,7 @@ async function runAgent(options: AgentOptions): Promise<void> {
 
   const machineName = options.machine || await getMachineName();
   const pollInterval = Math.max(3, parseInt(options.pollInterval, 10)) * 1000;
-  const workingDir = options.workingDir;
+  const workingDir = options.workingDir === '.' ? process.cwd() : options.workingDir;
 
   if (!options.machine) {
     const credCheck = await readCredentials();
@@ -868,11 +868,11 @@ async function executeTask(
 
 export function agentCommand(): Command {
   const cmd = new Command('agent');
-  cmd.description('Listen for tasks dispatched from Claude.ai and execute them with Claude Code');
+  cmd.description('Listen for tasks dispatched via CV-Hub and execute them with Claude Code');
 
-  cmd.option('--machine <name>', 'Machine name override');
-  cmd.option('--poll-interval <seconds>', 'How often to check for tasks', '5');
-  cmd.option('--working-dir <path>', 'Working directory for Claude Code', process.cwd());
+  cmd.option('--machine <name>', 'Override auto-detected machine name');
+  cmd.option('--poll-interval <seconds>', 'How often to check for tasks, minimum 3 (default: 5)', '5');
+  cmd.option('--working-dir <path>', 'Working directory for Claude Code (default: current directory)', '.');
   cmd.option('--auto-approve', 'Pre-approve all tool permissions (uses -p mode)', false);
 
   cmd.action(async (opts: AgentOptions) => {
