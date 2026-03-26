@@ -1,4 +1,7 @@
 import { build } from 'esbuild';
+import { readFileSync } from 'node:fs';
+
+const pkg = JSON.parse(readFileSync('package.json', 'utf-8'));
 
 await build({
   entryPoints: ['src/index.ts'],
@@ -11,6 +14,9 @@ await build({
   external: [],
   minify: false,
   sourcemap: true,
+  define: {
+    __CVA_VERSION__: JSON.stringify(pkg.version),
+  },
 });
 
 console.log('Built dist/bundle.cjs');
