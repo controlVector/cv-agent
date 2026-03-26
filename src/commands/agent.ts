@@ -226,8 +226,8 @@ const PERMISSION_PATTERNS = [
 // Auto-approve mode launcher (proven, -p + --allowedTools)
 // ============================================================================
 
-/** Max output buffer size (100KB) — truncate to last 100KB if exceeded */
-const MAX_OUTPUT_BYTES = 100 * 1024;
+/** Max output buffer size (200KB) — truncate to last 200KB if exceeded */
+const MAX_OUTPUT_BYTES = 200 * 1024;
 
 /** Interval (in bytes) at which to post progress events with output chunks */
 const OUTPUT_PROGRESS_INTERVAL = 4096;
