@@ -33,6 +33,7 @@ export interface PostTaskState {
 
 export interface TaskCompletionPayload {
   summary: string;
+  output: string;
   commit: {
     sha: string | null;
     branch: string | null;
@@ -194,6 +195,7 @@ export function buildCompletionPayload(
   preState: PreTaskState,
   postState: PostTaskState,
   startTime: number,
+  output: string = '',
 ): TaskCompletionPayload {
   const durationSec = Math.floor((Date.now() - startTime) / 1000);
   const durationStr = durationSec >= 60
@@ -227,6 +229,7 @@ export function buildCompletionPayload(
 
   return {
     summary: parts.join(' '),
+    output,
     commit: {
       sha: postState.headSha,
       branch: postState.branch,

@@ -226,14 +226,21 @@ const PERMISSION_PATTERNS = [
 // Auto-approve mode launcher (proven, -p + --allowedTools)
 // ============================================================================
 
+/** Max output buffer size (100KB) — truncate to last 100KB if exceeded */
+const MAX_OUTPUT_BYTES = 100 * 1024;
+
+/** Interval (in bytes) at which to post progress events with output chunks */
+const OUTPUT_PROGRESS_INTERVAL = 4096;
+
 async function launchAutoApproveMode(
   prompt: string,
   options: {
     cwd: string;
     creds?: CVHubCredentials;
     taskId?: string;
+    executorId?: string;
   },
-): Promise<{ exitCode: number; stderr: string }> {
+): Promise<{ exitCode: number; stderr: string; output: string }> {
   // Use a stable session ID so we can --continue if a question needs follow-up
   const sessionId = options.taskId
     ? options.taskId.replace(/-/g, '').slice(0, 32).padEnd(32, '0')
@@ -241,7 +248,10 @@ async function launchAutoApproveMode(
     : undefined;
   const pendingQuestionIds: string[] = [];
 
-  const runOnce = (inputPrompt: string, isContinue: boolean): Promise<{ exitCode: number; stderr: string }> => {
+  let fullOutput = '';
+  let lastProgressBytes = 0;
+
+  const runOnce = (inputPrompt: string, isContinue: boolean): Promise<{ exitCode: number; stderr: string; output: string }> => {
     return new Promise((resolve, reject) => {
       const args: string[] = isContinue
         ? ['-p', inputPrompt, '--continue', '--allowedTools', ...ALLOWED_TOOLS]
@@ -265,6 +275,12 @@ async function launchAutoApproveMode(
         const text = data.toString();
         process.stdout.write(data);
 
+        // Accumulate full output (capped at MAX_OUTPUT_BYTES)
+        fullOutput += text;
+        if (fullOutput.length > MAX_OUTPUT_BYTES) {
+          fullOutput = fullOutput.slice(-MAX_OUTPUT_BYTES);
+        }
+
         if (options.creds && options.taskId) {
           lineBuffer += text;
           const lines = lineBuffer.split('\n');
@@ -284,6 +300,16 @@ async function launchAutoApproveMode(
               }).catch(() => {});
             }
           }
+
+          // Post periodic progress with output chunk
+          if (fullOutput.length - lastProgressBytes >= OUTPUT_PROGRESS_INTERVAL) {
+            const chunk = fullOutput.slice(lastProgressBytes).slice(-OUTPUT_PROGRESS_INTERVAL);
+            lastProgressBytes = fullOutput.length;
+            if (options.executorId) {
+              sendTaskLog(options.creds!, options.executorId, options.taskId!, 'progress',
+                'Claude Code output', { output_chunk: chunk }).catch(() => {});
+            }
+          }
         }
       });
 
@@ -294,7 +320,7 @@ async function launchAutoApproveMode(
 
       child.on('close', (code, signal) => {
         _activeChild = null;
-        resolve({ exitCode: signal === 'SIGKILL' ? 137 : (code ?? 1), stderr });
+        resolve({ exitCode: signal === 'SIGKILL' ? 137 : (code ?? 1), stderr, output: fullOutput });
       });
 
       child.on('error', (err) => {
@@ -346,7 +372,7 @@ async function launchRelayMode(
     executorId: string;
     taskId: string;
   },
-): Promise<{ exitCode: number; stderr: string }> {
+): Promise<{ exitCode: number; stderr: string; output: string }> {
   return new Promise((resolve, reject) => {
     // Spawn Claude Code in interactive mode (no -p flag)
     const child = spawn('claude', [], {
@@ -358,6 +384,8 @@ async function launchRelayMode(
     _activeChild = child;
     let stderr = '';
     let stdoutBuffer = '';
+    let fullOutput = '';
+    let lastProgressBytes = 0;
 
     // Send the task prompt as initial input
     child.stdin?.write(prompt + '\n');
@@ -370,6 +398,12 @@ async function launchRelayMode(
       const text = data.toString();
       process.stdout.write(data); // Tee to terminal
       stdoutBuffer += text;
+
+      // Accumulate full output (capped at MAX_OUTPUT_BYTES)
+      fullOutput += text;
+      if (fullOutput.length > MAX_OUTPUT_BYTES) {
+        fullOutput = fullOutput.slice(-MAX_OUTPUT_BYTES);
+      }
 
       // Parse line-by-line for structured markers
       lineBuffer += text;
@@ -405,6 +439,14 @@ async function launchRelayMode(
             // Non-fatal: don't block execution
           }
         }
+      }
+
+      // Post periodic progress with output chunk
+      if (fullOutput.length - lastProgressBytes >= OUTPUT_PROGRESS_INTERVAL) {
+        const chunk = fullOutput.slice(lastProgressBytes).slice(-OUTPUT_PROGRESS_INTERVAL);
+        lastProgressBytes = fullOutput.length;
+        sendTaskLog(options.creds, options.executorId, options.taskId, 'progress',
+          'Claude Code output', { output_chunk: chunk }).catch(() => {});
       }
 
       // Periodic redirect check (every 10 seconds)
@@ -515,9 +557,9 @@ async function launchRelayMode(
     child.on('close', (code, signal) => {
       _activeChild = null;
       if (signal === 'SIGKILL') {
-        resolve({ exitCode: 137, stderr });
+        resolve({ exitCode: 137, stderr, output: fullOutput });
       } else {
-        resolve({ exitCode: code ?? 1, stderr });
+        resolve({ exitCode: code ?? 1, stderr, output: fullOutput });
       }
     });
 
@@ -688,6 +730,9 @@ async function executeTask(
   // Clear status line
   process.stdout.write('\r\x1b[K');
 
+  // Task received
+  console.log(`📥 ${chalk.bold.cyan('RECEIVED')}  — Task: ${task.title} (${task.priority})`);
+
   // Task header
   console.log(chalk.bold('┌─────────────────────────────────────────────────────────────┐'));
   console.log(chalk.bold(`│ Task: ${(task.title || '').substring(0, 53).padEnd(53)}│`));
@@ -744,19 +789,20 @@ async function executeTask(
 
   try {
     const mode = options.autoApprove ? 'auto-approve' : 'relay';
-    console.log(chalk.cyan('Launching Claude Code') + ` (${mode} mode)...`);
+    console.log(`🚀 ${chalk.bold.green('RUNNING')}   — Launching Claude Code (${mode})...`);
     if (options.autoApprove) {
       console.log(chalk.gray('   Allowed tools: ') + ALLOWED_TOOLS.join(', '));
     }
     console.log(chalk.gray('-'.repeat(60)));
 
-    let result: { exitCode: number; stderr: string };
+    let result: { exitCode: number; stderr: string; output: string };
 
     if (options.autoApprove) {
       result = await launchAutoApproveMode(prompt, {
         cwd: options.workingDir,
         creds,
         taskId: task.id,
+        executorId: state.executorId,
       });
     } else {
       result = await launchRelayMode(prompt, {
@@ -771,7 +817,7 @@ async function executeTask(
 
     // Capture post-task git state
     const postGitState = capturePostTaskState(options.workingDir, preGitState);
-    const payload = buildCompletionPayload(result.exitCode, preGitState, postGitState, startTime);
+    const payload = buildCompletionPayload(result.exitCode, preGitState, postGitState, startTime, result.output);
     const elapsed = formatDuration(Date.now() - startTime);
     const allChangedFiles = [
       ...postGitState.filesAdded,
@@ -800,6 +846,7 @@ async function executeTask(
         `Claude Code completed successfully (${elapsed})`, undefined, 100);
 
       console.log();
+      console.log(`✅ ${chalk.bold.green('COMPLETED')} — Duration: ${elapsed}`);
       printBanner('COMPLETED', elapsed, allChangedFiles, postGitState.headSha);
 
       await withRetry(
@@ -814,6 +861,7 @@ async function executeTask(
         'Task aborted by user (Ctrl+C)');
 
       console.log();
+      console.log(`⏹ ${chalk.bold.yellow('ABORTED')}   — Duration: ${elapsed}`);
       printBanner('ABORTED', elapsed, [], null);
 
       try {
@@ -827,6 +875,7 @@ async function executeTask(
         stderrTail ? { stderr_tail: stderrTail } : undefined);
 
       console.log();
+      console.log(`❌ ${chalk.bold.red('FAILED')}    — Duration: ${elapsed} (exit code ${result.exitCode})`);
       printBanner('FAILED', elapsed, allChangedFiles, postGitState.headSha);
 
       const errorDetail = result.stderr.trim()
