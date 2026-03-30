@@ -229,6 +229,9 @@ const PERMISSION_PATTERNS = [
 /** Max output buffer size (200KB) — truncate to last 200KB if exceeded */
 const MAX_OUTPUT_BYTES = 200 * 1024;
 
+/** Max size for output_final event content (50KB) */
+const MAX_OUTPUT_FINAL_BYTES = 50 * 1024;
+
 /** Interval (in bytes) at which to post progress events with output chunks */
 const OUTPUT_PROGRESS_INTERVAL = 4096;
 
@@ -309,6 +312,11 @@ async function launchAutoApproveMode(
               sendTaskLog(options.creds!, options.executorId, options.taskId!, 'progress',
                 'Claude Code output', { output_chunk: chunk }).catch(() => {});
             }
+            // Also post as output event for cv_task_summary/stream visibility
+            postTaskEvent(options.creds!, options.taskId!, {
+              event_type: 'output',
+              content: { chunk, byte_offset: lastProgressBytes },
+            }).catch(() => {});
           }
         }
       });
@@ -447,6 +455,11 @@ async function launchRelayMode(
         lastProgressBytes = fullOutput.length;
         sendTaskLog(options.creds, options.executorId, options.taskId, 'progress',
           'Claude Code output', { output_chunk: chunk }).catch(() => {});
+        // Also post as output event for cv_task_summary/stream visibility
+        postTaskEvent(options.creds, options.taskId, {
+          event_type: 'output',
+          content: { chunk, byte_offset: lastProgressBytes },
+        }).catch(() => {});
       }
 
       // Periodic redirect check (every 10 seconds)
@@ -596,6 +609,74 @@ async function pollForEventResponse(
 }
 
 // ============================================================================
+// Self-update handler
+// ============================================================================
+
+async function handleSelfUpdate(
+  task: Task,
+  state: AgentState,
+  creds: CVHubCredentials,
+): Promise<void> {
+  const startTime = Date.now();
+  try {
+    await startTask(creds, state.executorId, task.id);
+    sendTaskLog(creds, state.executorId, task.id, 'lifecycle', 'Self-update started');
+
+    const source = (task.input?.description || task.description || 'npm').trim();
+    let output = '';
+
+    if (source === 'npm' || source.startsWith('npm:')) {
+      const pkg = source === 'npm' ? '@controlvector/cv-agent@latest' : source.replace('npm:', '');
+      output = execSync(`npm install -g ${pkg} 2>&1`, { encoding: 'utf8', timeout: 120_000 });
+    } else if (source.startsWith('git:')) {
+      const repoPath = source.replace('git:', '');
+      output = execSync(`cd ${repoPath} && git pull && npm install && npm run build && npm link 2>&1`, {
+        encoding: 'utf8', timeout: 300_000,
+      });
+    } else {
+      // Default: try npm
+      output = execSync(`npm install -g @controlvector/cv-agent@latest 2>&1`, { encoding: 'utf8', timeout: 120_000 });
+    }
+
+    let newVersion = 'unknown';
+    try {
+      newVersion = execSync('cva --version 2>/dev/null || echo unknown', { encoding: 'utf8' }).trim();
+    } catch {}
+
+    // Post output as event so planner can see it
+    postTaskEvent(creds, task.id, {
+      event_type: 'output_final',
+      content: { output: output.slice(-10000), new_version: newVersion },
+    }).catch(() => {});
+
+    sendTaskLog(creds, state.executorId, task.id, 'lifecycle',
+      `Self-update completed. New version: ${newVersion}`, { output: output.slice(-5000) }, 100);
+
+    await completeTask(creds, state.executorId, task.id, {
+      summary: `Updated to ${newVersion}`,
+      exit_code: 0,
+      stats: { duration_seconds: Math.round((Date.now() - startTime) / 1000) },
+    });
+    state.completedCount++;
+
+    // Restart if requested
+    if (task.input?.constraints?.includes('restart')) {
+      console.log(chalk.yellow('Restarting agent with updated binary...'));
+      const args = process.argv.slice(1).join(' ');
+      execSync(`nohup cva ${args} > /tmp/cva-restart.log 2>&1 &`, { stdio: 'ignore' });
+      process.exit(0);
+    }
+  } catch (err: any) {
+    sendTaskLog(creds, state.executorId, task.id, 'error', `Self-update failed: ${err.message}`);
+    try { await failTask(creds, state.executorId, task.id, err.message); } catch {}
+    state.failedCount++;
+  } finally {
+    state.currentTaskId = null;
+    state.lastTaskEnd = Date.now();
+  }
+}
+
+// ============================================================================
 // Main agent loop
 // ============================================================================
 
@@ -727,6 +808,12 @@ async function executeTask(
   const startTime = Date.now();
   state.currentTaskId = task.id;
 
+  // Handle system update tasks — no Claude Code, just self-update
+  if (task.task_type === '_system_update') {
+    await handleSelfUpdate(task, state, creds);
+    return;
+  }
+
   // Clear status line
   process.stdout.write('\r\x1b[K');
 
@@ -848,6 +935,16 @@ async function executeTask(
       console.log();
       console.log(`✅ ${chalk.bold.green('COMPLETED')} — Duration: ${elapsed}`);
       printBanner('COMPLETED', elapsed, allChangedFiles, postGitState.headSha);
+
+      // Post final output as event for planner visibility
+      postTaskEvent(creds, task.id, {
+        event_type: 'output_final',
+        content: {
+          output: result.output.slice(-MAX_OUTPUT_FINAL_BYTES),
+          exit_code: result.exitCode,
+          duration_seconds: Math.round((Date.now() - startTime) / 1000),
+        },
+      }).catch(() => {});
 
       await withRetry(
         () => completeTask(creds, state.executorId, task.id, payload as unknown as Record<string, unknown>),
