@@ -26,6 +26,7 @@ import {
 } from '../utils/credentials.js';
 import {
   registerExecutor,
+  resolveRepoId,
   pollForTask,
   startTask,
   completeTask,
@@ -733,9 +734,38 @@ async function runAgent(options: AgentOptions): Promise<void> {
     }
   }
 
+  // Auto-detect CV-Hub repository from git remote
+  let detectedRepoId: string | undefined;
+  try {
+    const remoteUrl = execSync('git remote get-url origin 2>/dev/null', {
+      cwd: workingDir,
+      encoding: 'utf8',
+      timeout: 5000,
+    }).trim();
+
+    const cvHubMatch = remoteUrl.match(
+      /git\.hub\.controlvector\.io[:/]([^/]+)\/([^/.]+)/
+    );
+
+    if (cvHubMatch) {
+      const [, repoOwner, repoSlug] = cvHubMatch;
+      try {
+        const repoData = await resolveRepoId(creds, repoOwner, repoSlug);
+        if (repoData?.id) {
+          detectedRepoId = repoData.id;
+          console.log(chalk.gray(`   Repo:     ${repoOwner}/${repoSlug}`));
+        }
+      } catch {
+        // API call failed — register without repo binding
+      }
+    }
+  } catch {
+    // Not a git repo or no origin remote — that's fine
+  }
+
   // Register executor
   const executor = await withRetry(
-    () => registerExecutor(creds, machineName, workingDir),
+    () => registerExecutor(creds, machineName, workingDir, detectedRepoId),
     'Executor registration',
   );
 

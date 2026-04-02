@@ -37,9 +37,9 @@ export async function registerExecutor(
   creds: CVHubCredentials,
   machineName: string,
   workingDir: string,
+  repositoryId?: string,
 ): Promise<{ id: string; name: string }> {
-  const hostname = (await import('node:os')).hostname();
-  const res = await apiCall(creds, 'POST', '/api/v1/executors', {
+  const body: Record<string, unknown> = {
     name: `cva:${machineName}`,
     machine_name: machineName,
     type: 'claude_code',
@@ -48,7 +48,13 @@ export async function registerExecutor(
       tools: ['bash', 'read', 'write', 'edit', 'glob', 'grep'],
       maxConcurrentTasks: 1,
     },
-  });
+  };
+
+  if (repositoryId) {
+    body.repository_id = repositoryId;
+  }
+
+  const res = await apiCall(creds, 'POST', '/api/v1/executors', body);
 
   if (!res.ok) {
     const err = await res.text();
@@ -57,6 +63,23 @@ export async function registerExecutor(
 
   const data = await res.json() as any;
   return { id: data.executor.id, name: data.executor.name };
+}
+
+export async function resolveRepoId(
+  creds: CVHubCredentials,
+  owner: string,
+  repo: string,
+): Promise<{ id: string; slug: string } | null> {
+  try {
+    const res = await apiCall(creds, 'GET', `/api/v1/repos/${owner}/${repo}`);
+    if (!res.ok) return null;
+    const data = await res.json() as any;
+    return data.repository
+      ? { id: data.repository.id, slug: data.repository.slug }
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function markOffline(
