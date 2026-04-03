@@ -54,10 +54,24 @@ import {
   updateStatusLine,
 } from '../utils/display.js';
 import { withRetry } from '../utils/retry.js';
+import { readConfig } from '../utils/config.js';
 
 // ============================================================================
 // Types
 // ============================================================================
+
+export type AuthStatus = 'authenticated' | 'expired' | 'not_configured' | 'api_key_fallback';
+
+/** Patterns that indicate Claude Code auth failure */
+export const AUTH_ERROR_PATTERNS = [
+  'Not logged in',
+  'Please run /login',
+  'authentication required',
+  'unauthorized',
+  'expired token',
+  'not authenticated',
+  'login required',
+];
 
 interface AgentOptions {
   machine?: string;
@@ -74,6 +88,8 @@ interface AgentState {
   lastPoll: number;
   lastTaskEnd: number;
   running: boolean;
+  authStatus: AuthStatus;
+  machineName: string;
 }
 
 interface Task {
@@ -91,6 +107,95 @@ interface Task {
   file_paths?: string[];
   timeout_at?: string;
   metadata?: Record<string, unknown>;
+}
+
+// ============================================================================
+// Claude Code auth check & environment
+// ============================================================================
+
+/**
+ * Check if a string contains Claude Code auth error patterns.
+ * Exported for testing.
+ */
+export function containsAuthError(text: string): string | null {
+  const lower = text.toLowerCase();
+  for (const pattern of AUTH_ERROR_PATTERNS) {
+    if (lower.includes(pattern.toLowerCase())) {
+      return pattern;
+    }
+  }
+  return null;
+}
+
+/**
+ * Pre-flight check: verify Claude Code is authenticated.
+ * Runs `claude --version` and checks output/stderr for auth errors.
+ * Returns the detected auth status.
+ */
+export async function checkClaudeAuth(): Promise<{ status: AuthStatus; error?: string }> {
+  try {
+    const output = execSync('claude --version 2>&1', {
+      encoding: 'utf8',
+      timeout: 10_000,
+      env: { ...process.env },
+    });
+
+    const authError = containsAuthError(output);
+    if (authError) {
+      return { status: 'expired', error: authError };
+    }
+
+    return { status: 'authenticated' };
+  } catch (err: any) {
+    const output = (err.stdout || '') + (err.stderr || '') + (err.message || '');
+    const authError = containsAuthError(output);
+    if (authError) {
+      return { status: 'expired', error: authError };
+    }
+    // Binary not found or other error — not an auth issue per se
+    return { status: 'not_configured', error: output.slice(0, 500) };
+  }
+}
+
+/**
+ * Build the environment for spawning Claude Code.
+ * If an Anthropic API key is configured, inject it as ANTHROPIC_API_KEY.
+ */
+export async function getClaudeEnv(): Promise<{ env: NodeJS.ProcessEnv; usingApiKey: boolean }> {
+  const env = { ...process.env };
+  let usingApiKey = false;
+
+  // Don't override if already set in environment
+  if (!env.ANTHROPIC_API_KEY) {
+    try {
+      const config = await readConfig();
+      if (config.anthropic_api_key) {
+        env.ANTHROPIC_API_KEY = config.anthropic_api_key;
+        usingApiKey = true;
+      }
+    } catch {
+      // Config read failed — continue without API key
+    }
+  }
+
+  return { env, usingApiKey };
+}
+
+/**
+ * Build an actionable auth failure message with machine name and fix instructions.
+ */
+export function buildAuthFailureMessage(
+  errorString: string,
+  machineName: string,
+  hasApiKeyFallback: boolean,
+): string {
+  let msg = `CLAUDE_AUTH_REQUIRED: ${errorString}\n`;
+  msg += `Machine: ${machineName}\n`;
+  msg += `Fix: SSH into ${machineName} and run: claude /login\n`;
+  if (!hasApiKeyFallback) {
+    msg += `Alternative: Set an API key fallback with: cva auth set-api-key sk-ant-...\n`;
+  }
+  return msg;
 }
 
 // ============================================================================
@@ -243,8 +348,10 @@ async function launchAutoApproveMode(
     creds?: CVHubCredentials;
     taskId?: string;
     executorId?: string;
+    spawnEnv?: NodeJS.ProcessEnv;
+    machineName?: string;
   },
-): Promise<{ exitCode: number; stderr: string; output: string }> {
+): Promise<{ exitCode: number; stderr: string; output: string; authFailure?: boolean }> {
   // Use a stable session ID so we can --continue if a question needs follow-up
   const sessionId = options.taskId
     ? options.taskId.replace(/-/g, '').slice(0, 32).padEnd(32, '0')
@@ -255,7 +362,7 @@ async function launchAutoApproveMode(
   let fullOutput = '';
   let lastProgressBytes = 0;
 
-  const runOnce = (inputPrompt: string, isContinue: boolean): Promise<{ exitCode: number; stderr: string; output: string }> => {
+  const runOnce = (inputPrompt: string, isContinue: boolean): Promise<{ exitCode: number; stderr: string; output: string; authFailure: boolean }> => {
     return new Promise((resolve, reject) => {
       const args: string[] = isContinue
         ? ['-p', inputPrompt, '--continue', '--allowedTools', ...ALLOWED_TOOLS]
@@ -268,12 +375,14 @@ async function launchAutoApproveMode(
       const child = spawn('claude', args, {
         cwd: options.cwd,
         stdio: ['inherit', 'pipe', 'pipe'],
-        env: { ...process.env },
+        env: options.spawnEnv || { ...process.env },
       });
 
       _activeChild = child;
       let stderr = '';
       let lineBuffer = '';
+      let authFailure = false;
+      const spawnTime = Date.now();
 
       child.stdout?.on('data', (data: Buffer) => {
         const text = data.toString();
@@ -283,6 +392,21 @@ async function launchAutoApproveMode(
         fullOutput += text;
         if (fullOutput.length > MAX_OUTPUT_BYTES) {
           fullOutput = fullOutput.slice(-MAX_OUTPUT_BYTES);
+        }
+
+        // Early exit detection: check first 10s for auth errors
+        if (Date.now() - spawnTime < 10_000) {
+          const authError = containsAuthError(fullOutput + stderr);
+          if (authError) {
+            authFailure = true;
+            console.log(`\n${chalk.red('!')} Claude Code auth failure detected: "${authError}"`);
+            console.log(chalk.yellow(`  Killing process — it won't recover without re-authentication.`));
+            if (options.machineName) {
+              console.log(chalk.cyan(`  Fix: SSH into ${options.machineName} and run: claude /login`));
+            }
+            try { child.kill('SIGTERM'); } catch {}
+            return;
+          }
         }
 
         if (options.creds && options.taskId) {
@@ -323,13 +447,28 @@ async function launchAutoApproveMode(
       });
 
       child.stderr?.on('data', (data: Buffer) => {
-        stderr += data.toString();
+        const text = data.toString();
+        stderr += text;
         process.stderr.write(data);
+
+        // Early exit detection on stderr too
+        if (Date.now() - spawnTime < 10_000 && !authFailure) {
+          const authError = containsAuthError(text);
+          if (authError) {
+            authFailure = true;
+            console.log(`\n${chalk.red('!')} Claude Code auth failure (stderr): "${authError}"`);
+            try { child.kill('SIGTERM'); } catch {}
+          }
+        }
       });
 
       child.on('close', (code, signal) => {
         _activeChild = null;
-        resolve({ exitCode: signal === 'SIGKILL' ? 137 : (code ?? 1), stderr, output: fullOutput });
+        resolve({
+          exitCode: signal === 'SIGKILL' ? 137 : (code ?? 1),
+          stderr, output: fullOutput,
+          authFailure,
+        });
       });
 
       child.on('error', (err) => {
@@ -380,14 +519,16 @@ async function launchRelayMode(
     creds: CVHubCredentials;
     executorId: string;
     taskId: string;
+    spawnEnv?: NodeJS.ProcessEnv;
+    machineName?: string;
   },
-): Promise<{ exitCode: number; stderr: string; output: string }> {
+): Promise<{ exitCode: number; stderr: string; output: string; authFailure?: boolean }> {
   return new Promise((resolve, reject) => {
     // Spawn Claude Code in interactive mode (no -p flag)
     const child = spawn('claude', [], {
       cwd: options.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env },
+      env: options.spawnEnv || { ...process.env },
     });
 
     _activeChild = child;
@@ -395,6 +536,8 @@ async function launchRelayMode(
     let stdoutBuffer = '';
     let fullOutput = '';
     let lastProgressBytes = 0;
+    let authFailure = false;
+    const spawnTime = Date.now();
 
     // Send the task prompt as initial input
     child.stdin?.write(prompt + '\n');
@@ -412,6 +555,17 @@ async function launchRelayMode(
       fullOutput += text;
       if (fullOutput.length > MAX_OUTPUT_BYTES) {
         fullOutput = fullOutput.slice(-MAX_OUTPUT_BYTES);
+      }
+
+      // Early exit detection: check first 10s for auth errors
+      if (Date.now() - spawnTime < 10_000 && !authFailure) {
+        const authError = containsAuthError(fullOutput + stderr);
+        if (authError) {
+          authFailure = true;
+          console.log(`\n${chalk.red('!')} Claude Code auth failure detected: "${authError}"`);
+          try { child.kill('SIGTERM'); } catch {}
+          return;
+        }
       }
 
       // Parse line-by-line for structured markers
@@ -566,14 +720,24 @@ async function launchRelayMode(
       const text = data.toString();
       stderr += text;
       process.stderr.write(data);
+
+      // Early exit detection on stderr
+      if (Date.now() - spawnTime < 10_000 && !authFailure) {
+        const authError = containsAuthError(text);
+        if (authError) {
+          authFailure = true;
+          console.log(`\n${chalk.red('!')} Claude Code auth failure (stderr): "${authError}"`);
+          try { child.kill('SIGTERM'); } catch {}
+        }
+      }
     });
 
     child.on('close', (code, signal) => {
       _activeChild = null;
       if (signal === 'SIGKILL') {
-        resolve({ exitCode: 137, stderr, output: fullOutput });
+        resolve({ exitCode: 137, stderr, output: fullOutput, authFailure });
       } else {
-        resolve({ exitCode: code ?? 1, stderr, output: fullOutput });
+        resolve({ exitCode: code ?? 1, stderr, output: fullOutput, authFailure });
       }
     });
 
@@ -700,7 +864,7 @@ async function runAgent(options: AgentOptions): Promise<void> {
     process.exit(1);
   }
 
-  // Claude Code check
+  // Claude Code check (binary + auth pre-flight)
   try {
     execSync('claude --version', { stdio: 'pipe', timeout: 5000 });
   } catch {
@@ -709,6 +873,29 @@ async function runAgent(options: AgentOptions): Promise<void> {
     console.log(`   ${chalk.cyan('npm install -g @anthropic-ai/claude-code')}`);
     console.log();
     process.exit(1);
+  }
+
+  // Pre-flight auth check
+  const { env: claudeEnv, usingApiKey } = await getClaudeEnv();
+  const authCheck = await checkClaudeAuth();
+  let currentAuthStatus: AuthStatus = authCheck.status;
+
+  if (authCheck.status === 'expired') {
+    if (usingApiKey) {
+      console.log(chalk.yellow('!') + ' Claude Code OAuth expired, but API key fallback is configured.');
+      currentAuthStatus = 'api_key_fallback';
+    } else {
+      console.log();
+      console.log(chalk.red('Claude Code auth expired: ') + chalk.yellow(authCheck.error || 'unknown'));
+      console.log(`   Fix: Run ${chalk.cyan('claude /login')} to re-authenticate.`);
+      console.log(`   Alternative: ${chalk.cyan('cva auth set-api-key sk-ant-...')} for API key fallback.`);
+      console.log();
+      console.log(chalk.gray('Agent will start but pause task claims until auth is resolved.'));
+      console.log();
+    }
+  } else if (usingApiKey) {
+    console.log(chalk.gray('   Using Anthropic API key from config as fallback.'));
+    currentAuthStatus = 'api_key_fallback';
   }
 
   // cv-git check (warn, don't block)
@@ -792,6 +979,8 @@ async function runAgent(options: AgentOptions): Promise<void> {
     lastPoll: Date.now(),
     lastTaskEnd: Date.now(),
     running: true,
+    authStatus: currentAuthStatus,
+    machineName,
   };
 
   installSignalHandlers(
@@ -805,6 +994,20 @@ async function runAgent(options: AgentOptions): Promise<void> {
   // Main loop
   while (state.running) {
     try {
+      // If auth is expired (no fallback), re-check periodically instead of claiming tasks
+      if (state.authStatus === 'expired') {
+        const recheck = await checkClaudeAuth();
+        if (recheck.status === 'authenticated') {
+          state.authStatus = 'authenticated';
+          console.log(`\n${chalk.green('✓')} Claude Code auth restored. Resuming task claims.`);
+        } else {
+          // Still expired — heartbeat but don't poll for tasks
+          sendHeartbeat(creds, state.executorId, undefined, undefined, state.authStatus).catch(() => {});
+          await new Promise(r => setTimeout(r, pollInterval));
+          continue;
+        }
+      }
+
       const task = await withRetry(
         () => pollForTask(creds, state.executorId),
         'Task poll',
@@ -812,7 +1015,7 @@ async function runAgent(options: AgentOptions): Promise<void> {
       state.lastPoll = Date.now();
 
       if (task) {
-        await executeTask(task, state, creds, options);
+        await executeTask(task, state, creds, options, claudeEnv);
       } else {
         updateStatusLine(
           formatDuration(Date.now() - state.lastTaskEnd),
@@ -834,6 +1037,7 @@ async function executeTask(
   state: AgentState,
   creds: CVHubCredentials,
   options: AgentOptions,
+  claudeEnv?: NodeJS.ProcessEnv,
 ): Promise<void> {
   const startTime = Date.now();
   state.currentTaskId = task.id;
@@ -874,7 +1078,7 @@ async function executeTask(
     try {
       const elapsed = formatDuration(Date.now() - startTime);
       setTerminalTitle(`cva: ${task.title} (${elapsed})`);
-      await sendHeartbeat(creds, state.executorId, task.id, `Claude Code running (${elapsed} elapsed)`);
+      await sendHeartbeat(creds, state.executorId, task.id, `Claude Code running (${elapsed} elapsed)`, state.authStatus);
     } catch {}
   }, 30_000);
 
@@ -912,7 +1116,7 @@ async function executeTask(
     }
     console.log(chalk.gray('-'.repeat(60)));
 
-    let result: { exitCode: number; stderr: string; output: string };
+    let result: { exitCode: number; stderr: string; output: string; authFailure?: boolean };
 
     if (options.autoApprove) {
       result = await launchAutoApproveMode(prompt, {
@@ -920,6 +1124,8 @@ async function executeTask(
         creds,
         taskId: task.id,
         executorId: state.executorId,
+        spawnEnv: claudeEnv,
+        machineName: state.machineName,
       });
     } else {
       result = await launchRelayMode(prompt, {
@@ -927,6 +1133,8 @@ async function executeTask(
         creds,
         executorId: state.executorId,
         taskId: task.id,
+        spawnEnv: claudeEnv,
+        machineName: state.machineName,
       });
     }
 
@@ -995,6 +1203,38 @@ async function executeTask(
         await failTask(creds, state.executorId, task.id, 'Aborted by user (Ctrl+C)');
       } catch {}
       state.failedCount++;
+    } else if (result.authFailure) {
+      // Auth failure — produce actionable error message
+      const authErrorStr = containsAuthError(result.output + result.stderr) || 'auth failure';
+      const hasApiKey = !!(claudeEnv?.ANTHROPIC_API_KEY);
+      const authMsg = buildAuthFailureMessage(authErrorStr, state.machineName, hasApiKey);
+
+      sendTaskLog(creds, state.executorId, task.id, 'error', authMsg);
+
+      console.log();
+      console.log(`🔑 ${chalk.bold.red('AUTH FAILED')} — Claude Code is not authenticated`);
+      console.log(chalk.yellow(`   ${authMsg.replace(/\n/g, '\n   ')}`));
+
+      // Emit specific auth failure event
+      postTaskEvent(creds, task.id, {
+        event_type: 'auth_failure',
+        content: {
+          error: authErrorStr,
+          machine: state.machineName,
+          fix_command: `claude /login`,
+          api_key_configured: hasApiKey,
+        },
+      }).catch(() => {});
+
+      await withRetry(
+        () => failTask(creds, state.executorId, task.id, authMsg),
+        'Report auth failure',
+      );
+      state.failedCount++;
+
+      // Set auth status to expired so we stop claiming tasks
+      state.authStatus = 'expired';
+      console.log(chalk.yellow('   Pausing task claims until auth is restored.'));
     } else {
       const stderrTail = result.stderr.trim().slice(-500);
       sendTaskLog(creds, state.executorId, task.id, 'lifecycle',

@@ -179,6 +179,19 @@ describe('sendHeartbeat', () => {
     await sendHeartbeat(creds, 'exec-1', 'task-1', 'running');
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
+
+  it('includes auth_status in executor heartbeat when provided', async () => {
+    mockFetch.mockResolvedValue({ ok: true });
+    await sendHeartbeat(creds, 'exec-1', undefined, undefined, 'expired');
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.auth_status).toBe('expired');
+  });
+
+  it('sends no body when auth_status is not provided', async () => {
+    mockFetch.mockResolvedValue({ ok: true });
+    await sendHeartbeat(creds, 'exec-1');
+    expect(mockFetch.mock.calls[0][1].body).toBeUndefined();
+  });
 });
 
 describe('sendTaskLog', () => {

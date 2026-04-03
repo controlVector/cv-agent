@@ -137,11 +137,13 @@ export async function sendHeartbeat(
   executorId: string,
   taskId?: string,
   message?: string,
+  authStatus?: string,
 ): Promise<void> {
-  await apiCall(creds, 'POST', `/api/v1/executors/${executorId}/heartbeat`).catch(() => {});
+  const body: Record<string, unknown> | undefined = authStatus ? { auth_status: authStatus } : undefined;
+  await apiCall(creds, 'POST', `/api/v1/executors/${executorId}/heartbeat`, body).catch(() => {});
   if (taskId) {
-    const body = message ? { message, log_type: 'heartbeat' } : undefined;
-    await apiCall(creds, 'POST', `/api/v1/executors/${executorId}/tasks/${taskId}/heartbeat`, body).catch(() => {});
+    const taskBody = message ? { message, log_type: 'heartbeat' } : undefined;
+    await apiCall(creds, 'POST', `/api/v1/executors/${executorId}/tasks/${taskId}/heartbeat`, taskBody).catch(() => {});
   }
 }
 

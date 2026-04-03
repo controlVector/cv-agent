@@ -11,6 +11,7 @@ import {
   writeCredentialField,
 } from '../utils/credentials.js';
 import { apiCall } from '../utils/api.js';
+import { readConfig, writeConfig } from '../utils/config.js';
 
 async function authLogin(opts: { token?: string; apiUrl?: string }): Promise<void> {
   const token = opts.token || await promptForToken();
@@ -97,6 +98,32 @@ async function authStatus(): Promise<void> {
   }
 }
 
+async function authSetApiKey(key: string): Promise<void> {
+  if (!key.startsWith('sk-ant-')) {
+    console.log(chalk.red('Invalid API key.') + ' Anthropic API keys start with sk-ant-');
+    process.exit(1);
+  }
+
+  const config = await readConfig();
+  config.anthropic_api_key = key;
+  await writeConfig(config);
+
+  const masked = key.substring(0, 10) + '...' + key.slice(-4);
+  console.log(chalk.green('API key saved') + ` (${masked})`);
+  console.log(chalk.gray('This key will be used as fallback when Claude Code OAuth expires.'));
+}
+
+async function authRemoveApiKey(): Promise<void> {
+  const config = await readConfig();
+  if (!config.anthropic_api_key) {
+    console.log(chalk.yellow('No API key configured.'));
+    return;
+  }
+  delete config.anthropic_api_key;
+  await writeConfig(config);
+  console.log(chalk.green('API key removed.'));
+}
+
 export function authCommand(): Command {
   const cmd = new Command('auth');
   cmd.description('Manage CV-Hub authentication');
@@ -112,6 +139,17 @@ export function authCommand(): Command {
     .command('status')
     .description('Show current authentication status')
     .action(authStatus);
+
+  cmd
+    .command('set-api-key')
+    .description('Set Anthropic API key as fallback for Claude Code OAuth')
+    .argument('<key>', 'Anthropic API key (sk-ant-...)')
+    .action(authSetApiKey);
+
+  cmd
+    .command('remove-api-key')
+    .description('Remove stored Anthropic API key')
+    .action(authRemoveApiKey);
 
   return cmd;
 }

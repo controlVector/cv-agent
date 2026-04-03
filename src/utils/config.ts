@@ -10,6 +10,7 @@ export interface CvaConfig {
   defaultApiUrl?: string;
   defaultPollInterval?: number;
   autoApprove?: boolean;
+  anthropic_api_key?: string;
   [key: string]: unknown;
 }
 
