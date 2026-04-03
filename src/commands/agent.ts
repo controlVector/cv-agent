@@ -55,6 +55,8 @@ import {
 } from '../utils/display.js';
 import { withRetry } from '../utils/retry.js';
 import { readConfig } from '../utils/config.js';
+import { gitSafetyNet } from './git-safety.js';
+import { postTaskDeploy } from './deploy-manifest.js';
 
 // ============================================================================
 // Types
@@ -1140,7 +1142,34 @@ async function executeTask(
 
     console.log(chalk.gray('\n' + '-'.repeat(60)));
 
-    // Capture post-task git state
+    // ── Git Safety Net ──────────────────────────────────────────────────
+    // Ensure everything Claude Code touched is committed and pushed.
+    // This runs even if Claude Code already committed — it catches:
+    //   - Untracked files Claude forgot to add
+    //   - Modified files Claude forgot to stage
+    //   - Commits Claude made but forgot to push
+    if (result.exitCode === 0 || result.exitCode === 1) {
+      try {
+        const gitSafety = gitSafetyNet(
+          options.workingDir, task.title, task.id, task.branch,
+        );
+        if (gitSafety.hadChanges) {
+          sendTaskLog(creds, state.executorId, task.id, 'git',
+            `Safety net: committed ${gitSafety.filesAdded + gitSafety.filesModified} files (${gitSafety.commitSha || 'ok'})`,
+            { added: gitSafety.filesAdded, modified: gitSafety.filesModified, deleted: gitSafety.filesDeleted });
+        } else if (gitSafety.pushed) {
+          sendTaskLog(creds, state.executorId, task.id, 'git', 'Safety net: pushed unpushed commits');
+        }
+        if (gitSafety.error) {
+          sendTaskLog(creds, state.executorId, task.id, 'info', `Git safety warning: ${gitSafety.error}`);
+        }
+      } catch (gitErr: any) {
+        // Non-fatal — don't fail the task over git safety
+        sendTaskLog(creds, state.executorId, task.id, 'info', `Git safety net error: ${gitErr.message}`);
+      }
+    }
+
+    // Capture post-task git state (AFTER safety net so it includes safety net commits)
     const postGitState = capturePostTaskState(options.workingDir, preGitState);
     const payload = buildCompletionPayload(result.exitCode, preGitState, postGitState, startTime, result.output);
     const elapsed = formatDuration(Date.now() - startTime);
@@ -1149,6 +1178,26 @@ async function executeTask(
       ...postGitState.filesModified,
       ...postGitState.filesDeleted,
     ];
+
+    // ── Post-Task Deploy ──────────────────────────────────────────────
+    // If .cva/deploy.json exists, run build → migrate → restart → verify
+    let deployResult: { deployed: boolean; error?: string; rolledBack?: boolean } | undefined;
+    if (result.exitCode === 0) {
+      try {
+        const logFn = (type: string, msg: string) => {
+          sendTaskLog(creds, state.executorId, task.id, type, msg);
+        };
+        deployResult = await postTaskDeploy(options.workingDir, task.id, logFn);
+        if (deployResult.deployed) {
+          sendTaskLog(creds, state.executorId, task.id, 'lifecycle', 'Post-task deploy: verified');
+        } else if (deployResult.error) {
+          sendTaskLog(creds, state.executorId, task.id, 'error',
+            `Post-task deploy failed: ${deployResult.error}${deployResult.rolledBack ? ' (rolled back)' : ''}`);
+        }
+      } catch (deployErr: any) {
+        sendTaskLog(creds, state.executorId, task.id, 'info', `Deploy manifest error: ${deployErr.message}`);
+      }
+    }
 
     // Emit completion event via task events
     postTaskEvent(creds, task.id, {
