@@ -54,7 +54,13 @@ import {
   updateStatusLine,
 } from '../utils/display.js';
 import { withRetry } from '../utils/retry.js';
-import { readConfig } from '../utils/config.js';
+import {
+  readConfig,
+  readWorkspaceConfig,
+  type ExecutorRole,
+  type DispatchGuard,
+  type ExecutorIntegration,
+} from '../utils/config.js';
 import { gitSafetyNet } from './git-safety.js';
 import { postTaskDeploy } from './deploy-manifest.js';
 
@@ -80,6 +86,14 @@ interface AgentOptions {
   pollInterval: string;
   workingDir: string;
   autoApprove: boolean;
+  role?: ExecutorRole;
+  integration?: string;
+  integrationDescription?: string;
+  integrationPort?: string;
+  safeTasks?: string;
+  dispatchGuard?: DispatchGuard;
+  tags?: string;
+  ownerProject?: string;
 }
 
 interface AgentState {
@@ -952,9 +966,59 @@ async function runAgent(options: AgentOptions): Promise<void> {
     // Not a git repo or no origin remote — that's fine
   }
 
+  // Resolve executor identity metadata
+  // Priority: CLI flags > workspace .cva/agent.json > global config
+  const wsConfig = await readWorkspaceConfig(workingDir);
+  const globalConfig = await readConfig();
+
+  const role = (options.role || wsConfig.role || globalConfig.role || 'development') as ExecutorRole;
+  const dispatchGuard = (options.dispatchGuard || wsConfig.dispatch_guard || globalConfig.dispatch_guard || 'open') as DispatchGuard;
+  const tags = (options.tags?.split(',') || wsConfig.tags || globalConfig.tags)?.map((t: string) => t.trim()).filter(Boolean);
+  const ownerProject = options.ownerProject || wsConfig.owner_project || globalConfig.owner_project;
+
+  let integration: ExecutorIntegration | undefined;
+  if (options.integration || wsConfig.integration) {
+    if (options.integration) {
+      // Build from CLI flags
+      const safeTasks = options.safeTasks?.split(',').map(t => t.trim()).filter(Boolean);
+      const unsafeTasks = safeTasks
+        ? ['code_change', 'deploy', 'test', 'custom'].filter(t => !safeTasks.includes(t))
+        : undefined;
+      integration = {
+        system: options.integration,
+        description: options.integrationDescription || `Integrated into ${options.integration}`,
+        service_port: options.integrationPort ? parseInt(options.integrationPort, 10) : undefined,
+        safe_task_types: safeTasks,
+        unsafe_task_types: unsafeTasks,
+      };
+    } else if (wsConfig.integration) {
+      integration = wsConfig.integration;
+    }
+  }
+
+  const executorMeta: import('../utils/api.js').ExecutorRegistrationMetadata = {
+    role,
+    dispatch_guard: dispatchGuard,
+    tags,
+    owner_project: ownerProject,
+    integration,
+  };
+
+  // Display identity in banner
+  if (role !== 'development') {
+    console.log(chalk.yellow(`   Role:     ${role}`));
+  }
+  if (integration) {
+    console.log(chalk.yellow(`   Integration: ${integration.system}${integration.service_port ? ` (port ${integration.service_port})` : ''}`));
+  }
+  if (dispatchGuard !== 'open') {
+    const guardIcon = dispatchGuard === 'locked' ? '🔒' : '⚠️';
+    console.log(chalk.yellow(`   Guard:    ${guardIcon} ${dispatchGuard}`));
+  }
+
   // Register executor
   const executor = await withRetry(
-    () => registerExecutor(creds, machineName, workingDir, detectedRepoId),
+    () => registerExecutor(creds, machineName, workingDir, detectedRepoId, executorMeta),
     'Executor registration',
   );
 
@@ -1339,6 +1403,14 @@ export function agentCommand(): Command {
   cmd.option('--poll-interval <seconds>', 'How often to check for tasks, minimum 3 (default: 5)', '5');
   cmd.option('--working-dir <path>', 'Working directory for Claude Code (default: current directory)', '.');
   cmd.option('--auto-approve', 'Pre-approve all tool permissions (uses -p mode)', false);
+  cmd.option('--role <role>', 'Executor role: development, production, ci, staging');
+  cmd.option('--integration <system>', 'System this executor is integrated into (e.g. nyx-forge)');
+  cmd.option('--integration-description <desc>', 'Description of the integration');
+  cmd.option('--integration-port <port>', 'Port the integrated service runs on');
+  cmd.option('--safe-tasks <types>', 'Comma-separated task types safe for this executor (e.g. review,research)');
+  cmd.option('--dispatch-guard <guard>', 'Dispatch guard: open, confirm, locked (default: open)');
+  cmd.option('--tags <tags>', 'Comma-separated tags for this executor');
+  cmd.option('--owner-project <project>', 'Project this executor belongs to');
 
   cmd.action(async (opts: AgentOptions) => {
     await runAgent(opts);

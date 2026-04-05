@@ -33,11 +33,27 @@ export async function apiCall(
 // Executor lifecycle
 // ============================================================================
 
+export interface ExecutorRegistrationMetadata {
+  role?: string;
+  integration?: {
+    system: string;
+    description?: string;
+    service_port?: number;
+    safe_task_types?: string[];
+    unsafe_task_types?: string[];
+    self_referential?: boolean;
+  };
+  tags?: string[];
+  owner_project?: string;
+  dispatch_guard?: string;
+}
+
 export async function registerExecutor(
   creds: CVHubCredentials,
   machineName: string,
   workingDir: string,
   repositoryId?: string,
+  metadata?: ExecutorRegistrationMetadata,
 ): Promise<{ id: string; name: string }> {
   const body: Record<string, unknown> = {
     name: `cva:${machineName}`,
@@ -53,6 +69,13 @@ export async function registerExecutor(
   if (repositoryId) {
     body.repository_id = repositoryId;
   }
+
+  // Executor identity metadata
+  if (metadata?.role) body.role = metadata.role;
+  if (metadata?.dispatch_guard) body.dispatch_guard = metadata.dispatch_guard;
+  if (metadata?.tags) body.tags = metadata.tags;
+  if (metadata?.owner_project) body.owner_project = metadata.owner_project;
+  if (metadata?.integration) body.integration = metadata.integration;
 
   const res = await apiCall(creds, 'POST', '/api/v1/executors', body);
 
