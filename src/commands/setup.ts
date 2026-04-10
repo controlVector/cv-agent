@@ -240,6 +240,25 @@ async function runSetup(): Promise<void> {
     try {
       const existingRemote = execSync('git remote get-url cv-hub 2>/dev/null || echo ""', { cwd, encoding: 'utf8' }).trim();
       if (!existingRemote) {
+        // Create repo on CV-Hub (non-fatal if it already exists or fails)
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 15_000);
+          await fetch(`${hubUrl}/api/v1/user/repos`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ name: repoName, auto_init: false }),
+            signal: controller.signal,
+          });
+          clearTimeout(timeout);
+          console.log(chalk.green('  ✓') + ` Repo created on CV-Hub: ${username}/${repoName}`);
+        } catch {
+          // May already exist — that's fine
+        }
+
         execSync(`git remote add cv-hub ${remoteUrl}`, { cwd, stdio: 'pipe' });
         console.log(chalk.green('  ✓') + ` Remote added: cv-hub → ${remoteUrl}`);
       } else {
@@ -247,6 +266,34 @@ async function runSetup(): Promise<void> {
       }
     } catch {
       // Remote setup non-fatal
+    }
+
+    // Initial commit if repo has no commits
+    try {
+      execSync('git log --oneline -1', { cwd, stdio: 'pipe' });
+      // Has commits — check for uncommitted new files
+      const status = execSync('git status --porcelain', { cwd, encoding: 'utf8' }).trim();
+      if (status) {
+        execSync('git add -A', { cwd, stdio: 'pipe' });
+        execSync('git commit -m "chore: cv-agent setup"', { cwd, stdio: 'pipe' });
+        console.log(chalk.green('  ✓') + ' Changes committed');
+      }
+    } catch {
+      // No commits yet — make initial commit
+      try {
+        execSync('git add -A', { cwd, stdio: 'pipe' });
+        execSync('git commit -m "Initial commit via cv-agent"', { cwd, stdio: 'pipe' });
+        console.log(chalk.green('  ✓') + ' Initial commit created');
+      } catch { /* empty repo with nothing to commit */ }
+    }
+
+    // Push to CV-Hub
+    try {
+      execSync('git push -u cv-hub main 2>&1', { cwd, stdio: 'pipe', timeout: 30_000 });
+      console.log(chalk.green('  ✓') + ' Pushed to CV-Hub');
+    } catch {
+      // Push may fail if repo doesn't exist yet or auth issue — non-fatal
+      console.log(chalk.gray('  (Push skipped — you can push later with: git push cv-hub main)'));
     }
   }
 
