@@ -63,6 +63,134 @@ async function validateToken(hubUrl: string, token: string): Promise<string | nu
 }
 
 // ============================================================================
+// OAuth Device Authorization Flow (RFC 8628)
+// ============================================================================
+
+const DEVICE_CLIENT_ID = 'cv-agent-cli';
+const DEVICE_SCOPES = 'repo:read repo:write profile offline_access';
+const POLL_INTERVAL_MS = 5000;
+const MAX_POLL_ATTEMPTS = 180; // 15 minutes
+
+interface DeviceAuthResult {
+  token: string;
+  username: string;
+}
+
+async function deviceAuthFlow(hubUrl: string, appUrl: string): Promise<DeviceAuthResult> {
+  // Step 1: Request device authorization
+  const authRes = await fetch(`${hubUrl}/oauth/device/authorize`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: DEVICE_CLIENT_ID,
+      scope: DEVICE_SCOPES,
+    }),
+  });
+
+  if (!authRes.ok) {
+    const err = await authRes.json().catch(() => ({})) as { error_description?: string };
+    throw new Error(err.error_description || `Device auth failed: ${authRes.status}`);
+  }
+
+  const auth = await authRes.json() as {
+    device_code: string;
+    user_code: string;
+    verification_uri: string;
+    verification_uri_complete: string;
+    expires_in: number;
+    interval: number;
+  };
+
+  // Step 2: Display code and open browser
+  console.log(chalk.bold('  ┌──────────────────────────────────────────┐'));
+  console.log(chalk.bold('  │     CV-Hub Device Authorization          │'));
+  console.log(chalk.bold('  ├──────────────────────────────────────────┤'));
+  console.log(chalk.bold('  │                                          │'));
+  console.log(chalk.bold('  │  Open this URL in your browser:          │'));
+  console.log(chalk.bold(`  │  ${chalk.cyan(auth.verification_uri).padEnd(51)}│`));
+  console.log(chalk.bold('  │                                          │'));
+  console.log(chalk.bold('  │  Then enter this code:                   │'));
+  console.log(chalk.bold(`  │          ${chalk.white.bold(auth.user_code)}                       │`));
+  console.log(chalk.bold('  │                                          │'));
+  console.log(chalk.bold(`  │  ${chalk.gray(`Expires in ${Math.floor(auth.expires_in / 60)} minutes`).padEnd(51)}│`));
+  console.log(chalk.bold('  └──────────────────────────────────────────┘'));
+  console.log();
+
+  // Try to open browser
+  try {
+    const openCmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+    execSync(`${openCmd} "${auth.verification_uri_complete}" 2>/dev/null`, { timeout: 5000 });
+    console.log(chalk.gray('  Browser opened. Waiting for authorization...'));
+  } catch {
+    console.log(chalk.gray('  Open the URL above in your browser.'));
+  }
+
+  // Step 3: Poll for token
+  let interval = Math.max(auth.interval * 1000, POLL_INTERVAL_MS);
+  const expireTime = Date.now() + auth.expires_in * 1000;
+
+  for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
+    await new Promise(r => setTimeout(r, interval));
+
+    if (Date.now() > expireTime) {
+      throw new Error('Authorization timed out');
+    }
+
+    const remaining = Math.ceil((expireTime - Date.now()) / 1000);
+    const mins = Math.floor(remaining / 60);
+    const secs = remaining % 60;
+    process.stdout.write(`\r  Waiting for authorization... (${mins}:${secs.toString().padStart(2, '0')} remaining) `);
+
+    const tokenRes = await fetch(`${hubUrl}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+        device_code: auth.device_code,
+        client_id: DEVICE_CLIENT_ID,
+      }),
+    });
+
+    const tokenData = await tokenRes.json() as {
+      access_token?: string;
+      error?: string;
+      scope?: string;
+    };
+
+    if (tokenData.access_token) {
+      process.stdout.write('\r' + ' '.repeat(60) + '\r');
+
+      // Get username
+      let uname = 'user';
+      try {
+        const userRes = await fetch(`${hubUrl}/oauth/userinfo`, {
+          headers: { Authorization: `Bearer ${tokenData.access_token}` },
+        });
+        if (userRes.ok) {
+          const userInfo = await userRes.json() as { preferred_username?: string; name?: string };
+          uname = userInfo.preferred_username || userInfo.name || 'user';
+        }
+      } catch { /* use default */ }
+
+      return { token: tokenData.access_token, username: uname };
+    }
+
+    if (tokenData.error === 'slow_down') {
+      interval += 5000;
+    } else if (tokenData.error === 'access_denied') {
+      process.stdout.write('\r' + ' '.repeat(60) + '\r');
+      throw new Error('Authorization denied by user');
+    } else if (tokenData.error === 'expired_token') {
+      process.stdout.write('\r' + ' '.repeat(60) + '\r');
+      throw new Error('Authorization expired');
+    }
+    // authorization_pending → keep polling
+  }
+
+  throw new Error('Authorization timed out');
+}
+
+// ============================================================================
 // Preflight Checks
 // ============================================================================
 
@@ -144,53 +272,27 @@ async function runSetup(): Promise<void> {
     console.log('  Let\'s connect you to CV-Hub.');
     console.log();
 
-    const autoName = `${hostname()}-${new Date().toISOString().slice(0, 10)}`;
-    const tokenUrl = `${appUrl}/settings/tokens/new?name=${encodeURIComponent(autoName)}&scopes=agent,repo`;
-
-    console.log(chalk.gray(`  Opening: ${tokenUrl}`));
-
-    // Try to open browser
+    // Use OAuth Device Authorization flow (RFC 8628)
+    // Same flow as cv-git: CLI gets a code, user approves in browser, CLI gets token
     try {
-      const openCmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
-      execSync(`${openCmd} "${tokenUrl}" 2>/dev/null`, { timeout: 5000 });
-    } catch {
-      console.log(chalk.gray('  (Could not open browser — copy the URL above)'));
-    }
+      const deviceResult = await deviceAuthFlow(hubUrl, appUrl);
+      token = deviceResult.token;
+      username = deviceResult.username;
 
-    console.log();
+      console.log(chalk.green('  ✓') + ` Authenticated as ${chalk.bold(username)}`);
 
-    // Prompt for token
-    const readline = await import('node:readline');
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      // Save to shared credentials
+      writeSharedCreds({ hub_url: hubUrl, token, username, created_at: new Date().toISOString() });
 
-    token = await new Promise<string>((resolve) => {
-      rl.question('  Paste your token here: ', (answer: string) => {
-        rl.close();
-        resolve(answer.trim());
-      });
-    });
-
-    if (!token) {
-      console.log(chalk.red('  No token provided. Run cva setup again.'));
+      // Also save to cv-hub credentials for backward compatibility
+      await writeCredentialField('CV_HUB_PAT', token);
+      await writeCredentialField('CV_HUB_API', hubUrl);
+    } catch (err: any) {
+      console.log(chalk.red(`  Authentication failed: ${err.message}`));
+      console.log(chalk.gray('  You can retry with: cva setup'));
+      console.log(chalk.gray('  Or manually: cva auth login --token <your-pat>'));
       process.exit(1);
     }
-
-    // Validate
-    const user = await validateToken(hubUrl, token);
-    if (!user) {
-      console.log(chalk.red('  Token validation failed. Check your token and try again.'));
-      process.exit(1);
-    }
-
-    username = user;
-    console.log(chalk.green('  ✓') + ` Authenticated as ${chalk.bold(user)}`);
-
-    // Save to shared credentials
-    writeSharedCreds({ hub_url: hubUrl, token, username, created_at: new Date().toISOString() });
-
-    // Also save to cv-hub credentials for backward compatibility
-    await writeCredentialField('CV_HUB_PAT', token);
-    await writeCredentialField('CV_HUB_API', hubUrl);
   }
 
   console.log();
@@ -266,6 +368,20 @@ async function runSetup(): Promise<void> {
       }
     } catch {
       // Remote setup non-fatal
+    }
+
+    // Configure git credentials for CV-Hub pushes
+    try {
+      const credStorePath = join(homedir(), '.git-credentials');
+      const credLine = `https://${username}:${token}@${gitHost}`;
+      let existing = '';
+      try { existing = readFileSync(credStorePath, 'utf-8'); } catch { /* doesn't exist yet */ }
+      if (!existing.includes(gitHost)) {
+        writeFileSync(credStorePath, existing + credLine + '\n', { mode: 0o600 });
+      }
+      execSync(`git config --global credential.helper store`, { stdio: 'pipe' });
+    } catch {
+      // Non-fatal
     }
 
     // Initial commit if repo has no commits
