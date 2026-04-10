@@ -937,6 +937,56 @@ async function runAgent(options: AgentOptions): Promise<void> {
     }
   }
 
+  // ── Headless Repo Bootstrap ──────────────────────────────────────
+  // Silently ensure working dir is a git repo with CLAUDE.md and CV-Hub remote
+  {
+    const isGitRepo = require('fs').existsSync(require('path').join(workingDir, '.git'));
+    if (!isGitRepo) {
+      console.log(chalk.gray('   Bootstrap: initializing git repo...'));
+      try {
+        execSync('git init && git checkout -b main', { cwd: workingDir, stdio: 'pipe' });
+      } catch { /* best effort */ }
+    }
+
+    const claudeMdPath = require('path').join(workingDir, 'CLAUDE.md');
+    if (!require('fs').existsSync(claudeMdPath)) {
+      const name = require('path').basename(workingDir);
+      const template = `# ${name}\n\n## Overview\n[Describe your project here]\n\n## Build & Run\n[How to build and run this project]\n`;
+      try {
+        require('fs').writeFileSync(claudeMdPath, template);
+        console.log(chalk.gray('   Bootstrap: created CLAUDE.md'));
+      } catch { /* best effort */ }
+    }
+
+    const cvDir = require('path').join(workingDir, '.cv');
+    if (!require('fs').existsSync(cvDir)) {
+      try { require('fs').mkdirSync(cvDir, { recursive: true }); } catch {}
+    }
+
+    // Add CV-Hub remote if credentials available and no remote exists
+    if (creds.CV_HUB_PAT) {
+      try {
+        const existing = execSync('git remote get-url cv-hub 2>/dev/null || echo ""', {
+          cwd: workingDir, encoding: 'utf8', timeout: 5000,
+        }).trim();
+        if (!existing) {
+          const name = require('path').basename(workingDir);
+          const gitHost = 'git.hub.controlvector.io';
+          // Try to detect username from shared credentials
+          let user = 'user';
+          try {
+            const sharedPath = require('path').join(require('os').homedir(), '.config', 'controlvector', 'credentials.json');
+            const shared = JSON.parse(require('fs').readFileSync(sharedPath, 'utf-8'));
+            if (shared.username) user = shared.username;
+          } catch {}
+          const remoteUrl = `https://${gitHost}/${user}/${name}.git`;
+          execSync(`git remote add cv-hub ${remoteUrl}`, { cwd: workingDir, stdio: 'pipe' });
+          console.log(chalk.gray(`   Bootstrap: remote cv-hub → ${remoteUrl}`));
+        }
+      } catch { /* best effort */ }
+    }
+  }
+
   // Auto-detect CV-Hub repository from git remote
   let detectedRepoId: string | undefined;
   try {

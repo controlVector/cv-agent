@@ -1,6 +1,6 @@
 {
   "name": "@controlvector/cv-agent",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "Standalone agent daemon for CV-Hub — bridges Claude Code with CV-Hub task dispatch",
   "bin": {
     "cva": "./dist/bundle.cjs"

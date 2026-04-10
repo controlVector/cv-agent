@@ -309,19 +309,98 @@ async function runSetup(): Promise<void> {
   console.log();
 
   // ── Step 4: Repository Setup ───────────────────────────────────────
-  const cwd = process.cwd();
-  const isGitRepo = existsSync(join(cwd, '.git'));
-  const hasCVDir = existsSync(join(cwd, '.cv'));
-  const hasClaudeMd = existsSync(join(cwd, 'CLAUDE.md'));
-  const repoName = basename(cwd);
+  let cwd = process.cwd();
+  let isGitRepo = existsSync(join(cwd, '.git'));
+  let repoName = basename(cwd);
 
   if (isGitRepo) {
     console.log(chalk.green('  ✓') + ` Git repo found: ${repoName}`);
   } else {
-    console.log('  Initializing git repository...');
-    execSync('git init && git checkout -b main', { cwd, stdio: 'pipe' });
-    console.log(chalk.green('  ✓') + ' Git repo initialized');
+    // Offer options: init, clone, or change dir
+    const readline = await import('node:readline');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+    console.log('  No git repository found in this directory.');
+    console.log();
+    console.log(`    ${chalk.cyan('a')} — Initialize a new project here: ${cwd}`);
+    console.log(`    ${chalk.cyan('b')} — Clone an existing repo from CV-Hub`);
+    console.log();
+
+    const choice = await new Promise<string>((resolve) => {
+      rl.question('  Choose [a/b]: ', (answer: string) => {
+        rl.close();
+        resolve(answer.trim().toLowerCase() || 'a');
+      });
+    });
+
+    if (choice === 'b' && token) {
+      // Clone from CV-Hub
+      try {
+        console.log(chalk.gray('  Fetching your repositories...'));
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15_000);
+        const res = await fetch(`${hubUrl}/api/v1/repos?limit=50`, {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+
+        if (res.ok) {
+          const data = await res.json() as { repositories?: Array<{ name: string; slug: string; description?: string }> };
+          const repos = data.repositories || [];
+
+          if (repos.length === 0) {
+            console.log(chalk.yellow('  No repos found on CV-Hub. Initializing a new project instead.'));
+          } else {
+            console.log();
+            console.log('  Your CV-Hub repositories:');
+            const displayRepos = repos.slice(0, 20);
+            displayRepos.forEach((r, i) => {
+              const desc = r.description ? chalk.gray(` — ${r.description.substring(0, 40)}`) : '';
+              console.log(`    ${chalk.cyan(String(i + 1).padStart(2))}. ${r.slug || r.name}${desc}`);
+            });
+            console.log();
+
+            const rl2 = readline.createInterface({ input: process.stdin, output: process.stdout });
+            const selection = await new Promise<string>((resolve) => {
+              rl2.question(`  Select a repo [1-${displayRepos.length}]: `, (answer: string) => {
+                rl2.close();
+                resolve(answer.trim());
+              });
+            });
+
+            const idx = parseInt(selection, 10) - 1;
+            if (idx >= 0 && idx < displayRepos.length) {
+              const repo = displayRepos[idx];
+              const gitHost = 'git.hub.controlvector.io';
+              const slug = repo.slug || repo.name;
+              const cloneUrl = `https://${username}:${token}@${gitHost}/${username}/${slug}.git`;
+
+              console.log(chalk.gray(`  Cloning ${username}/${slug}...`));
+              execSync(`git clone ${cloneUrl} ${slug}`, { cwd, stdio: 'pipe', timeout: 60_000 });
+              cwd = join(cwd, slug);
+              process.chdir(cwd);
+              repoName = slug;
+              isGitRepo = true;
+              console.log(chalk.green('  ✓') + ` Cloned ${username}/${slug}`);
+            }
+          }
+        }
+      } catch (err: any) {
+        console.log(chalk.yellow(`  Could not fetch repos: ${err.message}. Initializing instead.`));
+      }
+    }
+
+    // If we haven't cloned, init a new repo
+    if (!isGitRepo) {
+      console.log('  Initializing git repository...');
+      execSync('git init && git checkout -b main', { cwd, stdio: 'pipe' });
+      console.log(chalk.green('  ✓') + ' Git repo initialized');
+    }
   }
+
+  const hasClaudeMd = existsSync(join(cwd, 'CLAUDE.md'));
+  const hasCVDir = existsSync(join(cwd, '.cv'));
 
   if (!hasClaudeMd) {
     const template = `# ${repoName}\n\n## Overview\n[Describe your project here]\n\n## Tech Stack\n[What languages/frameworks does this project use?]\n\n## Build & Run\n[How to build and run this project]\n`;
@@ -415,17 +494,82 @@ async function runSetup(): Promise<void> {
 
   console.log();
 
-  // ── Step 5: Summary ────────────────────────────────────────────────
+  // ── Step 5: Agent Daemon ────────────────────────────────────────────
+  let agentStatus = '';
+  const pidFile = join(homedir(), '.config', 'controlvector', 'agent.pid');
+
+  // Check if agent is already running
+  let agentRunning = false;
+  try {
+    const pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
+    if (pid > 0) {
+      process.kill(pid, 0); // throws if not running
+      agentRunning = true;
+      agentStatus = `running (PID ${pid})`;
+      console.log(chalk.green('  ✓') + ` Agent already running (PID ${pid})`);
+    }
+  } catch {
+    // PID file missing or process dead
+  }
+
+  if (!agentRunning) {
+    const readline = await import('node:readline');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await new Promise<string>((resolve) => {
+      rl.question('  Start the CV-Agent daemon? (Y/n): ', (a: string) => {
+        rl.close();
+        resolve(a.trim().toLowerCase() || 'y');
+      });
+    });
+
+    if (answer === 'y' || answer === 'yes' || answer === '') {
+      const machName = hostname().toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-');
+      console.log(chalk.gray(`  Starting agent as "${machName}"...`));
+
+      try {
+        const { spawn: spawnChild } = await import('node:child_process');
+        const child = spawnChild('cva', [
+          'agent', '--auto-approve', '--machine', machName, '--working-dir', cwd,
+        ], {
+          detached: true,
+          stdio: 'ignore',
+          env: { ...process.env },
+        });
+        child.unref();
+
+        if (child.pid) {
+          mkdirSync(join(homedir(), '.config', 'controlvector'), { recursive: true });
+          writeFileSync(pidFile, String(child.pid), { mode: 0o600 });
+          agentStatus = `running (PID ${child.pid})`;
+          console.log(chalk.green('  ✓') + ` Agent started (PID ${child.pid}) — executor "${machName}"`);
+        }
+      } catch (err: any) {
+        console.log(chalk.yellow(`  Could not start agent: ${err.message}`));
+        console.log(chalk.gray('  Start manually with: cva agent --auto-approve'));
+        agentStatus = 'not started';
+      }
+    } else {
+      agentStatus = 'not started';
+      console.log(chalk.gray('  Start anytime with: cva agent --auto-approve'));
+    }
+  }
+
+  console.log();
+
+  // ── Step 6: Summary ────────────────────────────────────────────────
   console.log(chalk.bold('  Setup Complete'));
   console.log(chalk.gray('  ' + '─'.repeat(40)));
   console.log(`  ${chalk.green('✓')} Authenticated as: ${chalk.cyan(username)}`);
   console.log(`  ${chalk.green('✓')} Repository: ${chalk.cyan(repoName)}`);
   console.log(`  ${chalk.green('✓')} CLAUDE.md: present`);
+  if (agentStatus.startsWith('running')) {
+    console.log(`  ${chalk.green('✓')} Agent daemon: ${chalk.cyan(agentStatus)}`);
+  }
   console.log(chalk.gray('  ' + '─'.repeat(40)));
   console.log();
   console.log('  What\'s next:');
-  console.log(`    ${chalk.cyan('cva agent --auto-approve')}  — Start listening for tasks`);
-  console.log(`    Or open Claude.ai and dispatch a task to this repo.`);
+  console.log('    Open Claude.ai and try:');
+  console.log(chalk.cyan(`    "Create a task in ${repoName} to add a hello world index.html"`));
   console.log();
   console.log(chalk.gray(`  Dashboard: ${appUrl}`));
   console.log();
