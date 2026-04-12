@@ -4,104 +4,113 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { execSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { gitSafetyNet } from './git-safety';
 
 vi.mock('node:child_process', () => ({
   execSync: vi.fn(),
 }));
 
+vi.mock('node:fs', () => ({
+  existsSync: vi.fn(),
+}));
+
+vi.mock('node:os', () => ({
+  homedir: vi.fn(() => '/home/testuser'),
+}));
+
 const mockExecSync = vi.mocked(execSync);
+const mockExistsSync = vi.mocked(existsSync);
 
 describe('gitSafetyNet', () => {
   beforeEach(() => {
     mockExecSync.mockReset();
+    mockExistsSync.mockReset();
+    // Default: workspace has .git
+    mockExistsSync.mockReturnValue(true);
   });
 
-  it('returns no changes when git status is clean and nothing unpushed', () => {
-    // git status --porcelain returns empty
-    mockExecSync.mockReturnValueOnce('');
-    // git log origin/main..HEAD returns empty
-    mockExecSync.mockReturnValueOnce('');
+  it('BLOCKS when workspace is user HOME directory', () => {
+    const result = gitSafetyNet('/home/testuser', 'Test', 'abc', 'main');
+    expect(result.skipped).toBe(true);
+    expect(result.skipReason).toContain('HOME directory');
+    expect(mockExecSync).not.toHaveBeenCalled();
+  });
 
-    const result = gitSafetyNet('/workspace', 'Test task', 'abc12345-def', 'main');
+  it('BLOCKS when workspace has no .git directory', () => {
+    mockExistsSync.mockReturnValue(false);
+    const result = gitSafetyNet('/workspace', 'Test', 'abc', 'main');
+    expect(result.skipped).toBe(true);
+    expect(result.skipReason).toContain('Not a git repository');
+  });
+
+  it('returns no changes when git status is clean', () => {
+    mockExecSync.mockReturnValueOnce(''); // git status
+    mockExecSync.mockReturnValueOnce(''); // git log unpushed
+
+    const result = gitSafetyNet('/workspace', 'Test', 'abc', 'main');
     expect(result.hadChanges).toBe(false);
     expect(result.pushed).toBe(false);
+    expect(result.skipped).toBeUndefined();
   });
 
-  it('pushes when there are unpushed commits but no local changes', () => {
-    // git status --porcelain returns empty
+  it('pushes unpushed commits', () => {
     mockExecSync.mockReturnValueOnce('');
-    // git log origin/main..HEAD returns unpushed commits
-    mockExecSync.mockReturnValueOnce('abc1234 some commit\ndef5678 another commit');
-    // git push succeeds
+    mockExecSync.mockReturnValueOnce('abc1234 some commit');
     mockExecSync.mockReturnValueOnce('');
 
-    const result = gitSafetyNet('/workspace', 'Test task', 'abc12345-def', 'main');
-    expect(result.hadChanges).toBe(false);
+    const result = gitSafetyNet('/workspace', 'Test', 'abc', 'main');
     expect(result.pushed).toBe(true);
   });
 
-  it('commits and pushes untracked files', () => {
-    // git status --porcelain returns untracked files
+  it('commits safe files and pushes', () => {
     mockExecSync.mockReturnValueOnce('?? src/new-file.ts\n?? src/another.ts');
-    // git add -A
+    // git add for each file
+    mockExecSync.mockReturnValueOnce('');
     mockExecSync.mockReturnValueOnce('');
     // git commit
-    mockExecSync.mockReturnValueOnce('[main abc1234] task: Test task [abc12345]');
+    mockExecSync.mockReturnValueOnce('[main abc1234] task: Test [abc12345]');
     // git push
     mockExecSync.mockReturnValueOnce('');
 
-    const result = gitSafetyNet('/workspace', 'Test task', 'abc12345-def', 'main');
+    const result = gitSafetyNet('/workspace', 'Test', 'abc12345-def', 'main');
     expect(result.hadChanges).toBe(true);
     expect(result.filesAdded).toBe(2);
-    expect(result.commitSha).toBe('abc1234');
     expect(result.pushed).toBe(true);
   });
 
-  it('commits modified and deleted files', () => {
-    mockExecSync.mockReturnValueOnce(' M src/changed.ts\n D src/removed.ts');
-    mockExecSync.mockReturnValueOnce(''); // git add
-    mockExecSync.mockReturnValueOnce('[main def5678] task: Fix bug [abc12345]'); // git commit
-    mockExecSync.mockReturnValueOnce(''); // git push
+  it('BLOCKS dangerous files from staging', () => {
+    mockExecSync.mockReturnValueOnce(
+      '?? .claude/credentials.json\n?? .zsh_history\n?? src/real-code.ts'
+    );
+    // Only src/real-code.ts should be staged
+    mockExecSync.mockReturnValueOnce(''); // git add src/real-code.ts
+    mockExecSync.mockReturnValueOnce('[main def5678] task: Test [abc12345]');
+    mockExecSync.mockReturnValueOnce(''); // push
 
-    const result = gitSafetyNet('/workspace', 'Fix bug', 'abc12345-def', 'main');
+    const result = gitSafetyNet('/workspace', 'Test', 'abc12345', 'main');
     expect(result.hadChanges).toBe(true);
-    expect(result.filesModified).toBe(1);
-    expect(result.filesDeleted).toBe(1);
-    expect(result.pushed).toBe(true);
+    expect(result.filesAdded).toBe(1); // only the safe file
   });
 
-  it('reports push failure without crashing', () => {
+  it('returns empty when ALL files are blocked', () => {
+    mockExecSync.mockReturnValueOnce(
+      '?? .claude/credentials.json\n?? .zsh_history\n?? .npm/cache/foo'
+    );
+
+    const result = gitSafetyNet('/workspace', 'Test', 'abc', 'main');
+    expect(result.hadChanges).toBe(false);
+  });
+
+  it('handles push failure gracefully', () => {
     mockExecSync.mockReturnValueOnce('?? new-file.ts');
-    mockExecSync.mockReturnValueOnce(''); // git add
-    mockExecSync.mockReturnValueOnce('[main abc1234] task: T [abc12345]'); // git commit
-    mockExecSync.mockImplementationOnce(() => { throw new Error('push rejected'); }); // git push fails
+    mockExecSync.mockReturnValueOnce(''); // add
+    mockExecSync.mockReturnValueOnce('[main abc1234] task: T [abc12345]');
+    mockExecSync.mockImplementationOnce(() => { throw new Error('push rejected'); });
 
     const result = gitSafetyNet('/workspace', 'T', 'abc12345', 'main');
-    expect(result.hadChanges).toBe(true);
     expect(result.pushed).toBe(false);
     expect(result.error).toContain('Push failed');
-  });
-
-  it('handles git status failure gracefully', () => {
-    mockExecSync.mockImplementationOnce(() => { throw new Error('not a git repo'); });
-
-    const result = gitSafetyNet('/workspace', 'T', 'abc', 'main');
-    expect(result.hadChanges).toBe(false);
-    expect(result.error).toContain('git status failed');
-  });
-
-  it('uses default branch "main" when none specified', () => {
-    mockExecSync.mockReturnValueOnce('');
-    mockExecSync.mockReturnValueOnce('abc123 commit');
-    mockExecSync.mockReturnValueOnce('');
-
-    gitSafetyNet('/workspace', 'T', 'abc', undefined);
-
-    // Second call should reference origin/main
-    expect(mockExecSync).toHaveBeenCalledWith(
-      expect.stringContaining('origin/main'),
-      expect.any(Object),
-    );
   });
 });

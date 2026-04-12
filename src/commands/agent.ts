@@ -880,15 +880,50 @@ async function runAgent(options: AgentOptions): Promise<void> {
     process.exit(1);
   }
 
-  // Claude Code check (binary + auth pre-flight)
+  // Log environment info for debugging Launch Agent issues (Bug 1)
+  if (process.env.CV_DEBUG) {
+    console.log(chalk.gray(`   PATH: ${process.env.PATH}`));
+    console.log(chalk.gray(`   HOME: ${process.env.HOME}`));
+    console.log(chalk.gray(`   SHELL: ${process.env.SHELL}`));
+  }
+
+  // Claude Code check — search common install locations if not on PATH
+  let claudeBinary = 'claude';
   try {
     execSync('claude --version', { stdio: 'pipe', timeout: 5000 });
   } catch {
-    console.log();
-    console.log(chalk.red('Claude Code CLI not found.') + ' Install it first:');
-    console.log(`   ${chalk.cyan('npm install -g @anthropic-ai/claude-code')}`);
-    console.log();
-    process.exit(1);
+    // Try common locations (Launch Agent may not have full PATH)
+    const candidates = [
+      '/usr/local/bin/claude',
+      '/opt/homebrew/bin/claude',
+      `${process.env.HOME}/.npm-global/bin/claude`,
+      `${process.env.HOME}/.nvm/versions/node/*/bin/claude`,
+    ];
+    let found = false;
+    for (const candidate of candidates) {
+      try {
+        // Handle glob patterns
+        const resolved = execSync(`ls ${candidate} 2>/dev/null | head -1`, { encoding: 'utf8', timeout: 3000 }).trim();
+        if (resolved) {
+          execSync(`${resolved} --version`, { stdio: 'pipe', timeout: 5000 });
+          claudeBinary = resolved;
+          found = true;
+          console.log(chalk.yellow('!') + ` Claude Code found at ${resolved} (not on PATH)`);
+          break;
+        }
+      } catch { /* try next */ }
+    }
+
+    if (!found) {
+      console.log();
+      console.log(chalk.red('Claude Code CLI not found.') + ' Install it first:');
+      console.log(`   ${chalk.cyan('npm install -g @anthropic-ai/claude-code')}`);
+      console.log();
+      console.log(chalk.gray(`   Current PATH: ${process.env.PATH}`));
+      console.log(chalk.gray('   If running via Launch Agent, ensure PATH includes the directory where claude is installed.'));
+      console.log();
+      process.exit(1);
+    }
   }
 
   // Pre-flight auth check
