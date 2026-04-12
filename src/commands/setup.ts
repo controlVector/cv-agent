@@ -410,6 +410,46 @@ async function runSetup(): Promise<void> {
     console.log(chalk.green('  ✓') + ' CLAUDE.md present');
   }
 
+  // Ensure .gitignore blocks credentials and sensitive files
+  const gitignorePath = join(cwd, '.gitignore');
+  const CREDENTIAL_PATTERNS = [
+    '# Credentials and secrets (auto-added by cv-agent)',
+    '.env',
+    '.env.*',
+    '.claude/',
+    '.claude.json',
+    '.credentials*',
+    '*.pem',
+    '*.key',
+    '.ssh/',
+    '.gnupg/',
+    '.npm/',
+    '.config/',
+    '.zsh_history',
+    '.bash_history',
+    '.zsh_sessions/',
+    'node_modules/',
+    '.DS_Store',
+  ];
+
+  try {
+    let gitignoreContent = '';
+    if (existsSync(gitignorePath)) {
+      gitignoreContent = readFileSync(gitignorePath, 'utf-8');
+    }
+    // Add any missing credential patterns
+    const missing = CREDENTIAL_PATTERNS.filter(p => !gitignoreContent.includes(p));
+    if (missing.length > 0) {
+      const addition = (gitignoreContent && !gitignoreContent.endsWith('\n') ? '\n' : '') + missing.join('\n') + '\n';
+      writeFileSync(gitignorePath, gitignoreContent + addition);
+      console.log(chalk.green('  ✓') + ' .gitignore updated with credential protection');
+    } else {
+      console.log(chalk.green('  ✓') + ' .gitignore has credential protection');
+    }
+  } catch {
+    // Non-fatal
+  }
+
   if (!hasCVDir) {
     mkdirSync(join(cwd, '.cv'), { recursive: true });
   }

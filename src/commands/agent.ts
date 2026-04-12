@@ -272,6 +272,14 @@ function buildClaudePrompt(task: Task): string {
   prompt += `\n`;
   prompt += `IMPORTANT: Do NOT run \`cva\` commands. The \`cva\` binary is the agent daemon that launched you — calling it would cause recursion.\n`;
 
+  prompt += `\n\n## Security — NEVER Commit Secrets\n`;
+  prompt += `Do NOT add, commit, or push any of the following:\n`;
+  prompt += `- API keys, tokens, passwords, or credentials\n`;
+  prompt += `- .env files, .credentials files, .claude/ directory\n`;
+  prompt += `- SSH keys (.ssh/), GPG keys (.gnupg/)\n`;
+  prompt += `- Shell history (.zsh_history, .bash_history)\n`;
+  prompt += `If you need to reference an API key, use an environment variable placeholder.\n`;
+
   prompt += `\n\n---\n`;
   prompt += `When complete, provide a brief summary of what you accomplished.\n`;
 
@@ -992,6 +1000,20 @@ async function runAgent(options: AgentOptions): Promise<void> {
         console.log(chalk.gray('   Bootstrap: created CLAUDE.md'));
       } catch { /* best effort */ }
     }
+
+    // Ensure .gitignore blocks credentials
+    const gitignorePath = require('path').join(workingDir, '.gitignore');
+    try {
+      const fs = require('fs');
+      const credPatterns = '.env\n.env.*\n.claude/\n.claude.json\n.credentials*\n*.pem\n*.key\n.ssh/\n.gnupg/\n.npm/\n.config/\n.zsh_history\n.bash_history\nnode_modules/\n.DS_Store\n';
+      let existing = '';
+      try { existing = fs.readFileSync(gitignorePath, 'utf-8'); } catch {}
+      if (!existing.includes('.claude/')) {
+        const prefix = existing && !existing.endsWith('\n') ? '\n' : '';
+        fs.writeFileSync(gitignorePath, existing + prefix + '# Credentials (auto-added by cv-agent)\n' + credPatterns);
+        console.log(chalk.gray('   Bootstrap: .gitignore credential protection added'));
+      }
+    } catch { /* best effort */ }
 
     const cvDir = require('path').join(workingDir, '.cv');
     if (!require('fs').existsSync(cvDir)) {
