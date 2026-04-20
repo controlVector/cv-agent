@@ -2,6 +2,25 @@
 
 All notable changes to CV-Agent will be documented in this file.
 
+## [1.10.0] - 2026-04-20
+
+> Version jump: the 1.3.x–1.9.x range was published to npm from side branches
+> without corresponding git commits on main. Bumping straight to 1.10.0 to
+> stay ahead of the published range.
+
+### Fixed
+- **Output events now actually reach CV-Hub** — v1.2.0 posted `output` and `output_final` events but the server enum rejected them, silently swallowed by fire-and-forget error handlers. Requires cv-hub with the matching enum migration (0041).
+
+### Added
+- **Reliable event delivery** — New `EventQueue` (`src/utils/event-queue.ts`) drains output events with bounded exponential backoff, spills pending events to disk on crash or network failure, and reloads the spill on the next run for at-least-once delivery
+- **Sequence numbers** — Output events carry monotonic `sequence_number` so the planner can reconstruct ordering deterministically under same-millisecond bursts
+- **Truncation markers** — When the 200KB rolling output buffer drops bytes, a visible `[... N bytes truncated ...]` event is emitted instead of silently sliding
+- **Event-queue test suite** — 6 tests covering delivery, retry, disk spill, replay on startup, and close semantics
+
+### Changed
+- `postTaskEvent` now accepts an optional `sequence_number` parameter
+- `executeTask` creates one `EventQueue` per task and flushes it in the `finally` block
+
 ## [1.2.0] - 2026-03-30
 
 ### Added

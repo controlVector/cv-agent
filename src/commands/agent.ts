@@ -18,7 +18,10 @@
 
 import { Command } from 'commander';
 import { spawn, execSync, type ChildProcess } from 'node:child_process';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import chalk from 'chalk';
+import { EventQueue } from '../utils/event-queue.js';
 import {
   readCredentials,
   getMachineName,
@@ -366,6 +369,7 @@ async function launchAutoApproveMode(
     executorId?: string;
     spawnEnv?: NodeJS.ProcessEnv;
     machineName?: string;
+    eventQueue?: EventQueue;
   },
 ): Promise<{ exitCode: number; stderr: string; output: string; authFailure?: boolean }> {
   // Use a stable session ID so we can --continue if a question needs follow-up
@@ -377,6 +381,7 @@ async function launchAutoApproveMode(
 
   let fullOutput = '';
   let lastProgressBytes = 0;
+  let totalBytesStreamed = 0;
 
   const runOnce = (inputPrompt: string, isContinue: boolean): Promise<{ exitCode: number; stderr: string; output: string; authFailure: boolean }> => {
     return new Promise((resolve, reject) => {
@@ -404,11 +409,23 @@ async function launchAutoApproveMode(
         const text = data.toString();
         process.stdout.write(data);
 
-        // Accumulate full output (capped at MAX_OUTPUT_BYTES)
+        // Accumulate full output (capped at MAX_OUTPUT_BYTES).
+        // When the rolling buffer drops bytes, emit a visible truncation marker
+        // so consumers see a gap instead of a silent rewind.
         fullOutput += text;
         if (fullOutput.length > MAX_OUTPUT_BYTES) {
+          const dropped = fullOutput.length - MAX_OUTPUT_BYTES;
           fullOutput = fullOutput.slice(-MAX_OUTPUT_BYTES);
+          options.eventQueue?.enqueue({
+            event_type: 'output',
+            content: {
+              chunk: `\n[... ${dropped} bytes truncated from output buffer ...]\n`,
+              truncated_bytes: dropped,
+              byte_offset: totalBytesStreamed,
+            },
+          });
         }
+        totalBytesStreamed += text.length;
 
         // Early exit detection: check first 10s for auth errors
         if (Date.now() - spawnTime < 10_000) {
@@ -453,11 +470,12 @@ async function launchAutoApproveMode(
               sendTaskLog(options.creds!, options.executorId, options.taskId!, 'progress',
                 'Claude Code output', { output_chunk: chunk }).catch(() => {});
             }
-            // Also post as output event for cv_task_summary/stream visibility
-            postTaskEvent(options.creds!, options.taskId!, {
+            // Enqueue output event for cv_task_summary/stream visibility.
+            // The queue retries transient failures and spills to disk on crash.
+            options.eventQueue?.enqueue({
               event_type: 'output',
-              content: { chunk, byte_offset: lastProgressBytes },
-            }).catch(() => {});
+              content: { chunk, byte_offset: totalBytesStreamed },
+            });
           }
         }
       });
@@ -537,6 +555,7 @@ async function launchRelayMode(
     taskId: string;
     spawnEnv?: NodeJS.ProcessEnv;
     machineName?: string;
+    eventQueue?: EventQueue;
   },
 ): Promise<{ exitCode: number; stderr: string; output: string; authFailure?: boolean }> {
   return new Promise((resolve, reject) => {
@@ -554,6 +573,7 @@ async function launchRelayMode(
     let lastProgressBytes = 0;
     let authFailure = false;
     const spawnTime = Date.now();
+    let totalBytesStreamed = 0;
 
     // Send the task prompt as initial input
     child.stdin?.write(prompt + '\n');
@@ -567,11 +587,22 @@ async function launchRelayMode(
       process.stdout.write(data); // Tee to terminal
       stdoutBuffer += text;
 
-      // Accumulate full output (capped at MAX_OUTPUT_BYTES)
+      // Accumulate full output (capped at MAX_OUTPUT_BYTES).
+      // Emit a truncation marker when bytes are dropped so the planner sees a gap.
       fullOutput += text;
       if (fullOutput.length > MAX_OUTPUT_BYTES) {
+        const dropped = fullOutput.length - MAX_OUTPUT_BYTES;
         fullOutput = fullOutput.slice(-MAX_OUTPUT_BYTES);
+        options.eventQueue?.enqueue({
+          event_type: 'output',
+          content: {
+            chunk: `\n[... ${dropped} bytes truncated from output buffer ...]\n`,
+            truncated_bytes: dropped,
+            byte_offset: totalBytesStreamed,
+          },
+        });
       }
+      totalBytesStreamed += text.length;
 
       // Early exit detection: check first 10s for auth errors
       if (Date.now() - spawnTime < 10_000 && !authFailure) {
@@ -626,11 +657,11 @@ async function launchRelayMode(
         lastProgressBytes = fullOutput.length;
         sendTaskLog(options.creds, options.executorId, options.taskId, 'progress',
           'Claude Code output', { output_chunk: chunk }).catch(() => {});
-        // Also post as output event for cv_task_summary/stream visibility
-        postTaskEvent(options.creds, options.taskId, {
+        // Enqueue output event — queue retries transient failures and spills to disk on crash.
+        options.eventQueue?.enqueue({
           event_type: 'output',
-          content: { chunk, byte_offset: lastProgressBytes },
-        }).catch(() => {});
+          content: { chunk, byte_offset: totalBytesStreamed },
+        });
       }
 
       // Periodic redirect check (every 10 seconds)
@@ -1174,6 +1205,18 @@ async function executeTask(
   // Build prompt and launch
   const prompt = buildClaudePrompt(task);
 
+  // Persistent event queue — retries failed output events, spills to disk on
+  // crash, assigns monotonic sequence numbers. One queue per task; spill file
+  // lives in OS tmp keyed by task ID and is cleaned up on successful flush.
+  const spillPath = path.join(os.tmpdir(), 'cva-event-queue', `${task.id}.ndjson`);
+  const eventQueue = new EventQueue({
+    spillPath,
+    poster: async (event) => {
+      await postTaskEvent(creds, task.id, event);
+    },
+  });
+  await eventQueue.loadSpill();
+
   try {
     const mode = options.autoApprove ? 'auto-approve' : 'relay';
     console.log(`🚀 ${chalk.bold.green('RUNNING')}   — Launching Claude Code (${mode})...`);
@@ -1192,6 +1235,7 @@ async function executeTask(
         executorId: state.executorId,
         spawnEnv: claudeEnv,
         machineName: state.machineName,
+        eventQueue,
       });
     } else {
       result = await launchRelayMode(prompt, {
@@ -1201,6 +1245,7 @@ async function executeTask(
         taskId: task.id,
         spawnEnv: claudeEnv,
         machineName: state.machineName,
+        eventQueue,
       });
     }
 
@@ -1264,14 +1309,14 @@ async function executeTask(
     }
 
     // Emit completion event via task events
-    postTaskEvent(creds, task.id, {
+    eventQueue.enqueue({
       event_type: 'completed',
       content: {
         exit_code: result.exitCode,
         duration_seconds: Math.round((Date.now() - startTime) / 1000),
         files_changed: allChangedFiles.length,
       },
-    }).catch(() => {});
+    });
 
     if (result.exitCode === 0) {
       if (allChangedFiles.length > 0) {
@@ -1287,15 +1332,16 @@ async function executeTask(
       console.log(`✅ ${chalk.bold.green('COMPLETED')} — Duration: ${elapsed}`);
       printBanner('COMPLETED', elapsed, allChangedFiles, postGitState.headSha);
 
-      // Post final output as event for planner visibility
-      postTaskEvent(creds, task.id, {
+      // Post final output as event for planner visibility.
+      // Enqueued so it rides the same retry/spill path as streamed output.
+      eventQueue.enqueue({
         event_type: 'output_final',
         content: {
           output: result.output.slice(-MAX_OUTPUT_FINAL_BYTES),
           exit_code: result.exitCode,
           duration_seconds: Math.round((Date.now() - startTime) / 1000),
         },
-      }).catch(() => {});
+      });
 
       await withRetry(
         () => completeTask(creds, state.executorId, task.id, payload as unknown as Record<string, unknown>),
@@ -1381,6 +1427,10 @@ async function executeTask(
   } finally {
     clearInterval(heartbeatTimer);
     if (timeoutTimer) clearTimeout(timeoutTimer);
+    // Flush and close the event queue so final output + completed events
+    // reach CV-Hub. If the queue still has pending events after all retries,
+    // they're left on disk for the next run to pick up.
+    try { await eventQueue.close(); } catch {}
     state.currentTaskId = null;
     state.lastTaskEnd = Date.now();
   }
