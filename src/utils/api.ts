@@ -277,6 +277,7 @@ export async function postTaskEvent(
     event_type: string;
     content: Record<string, unknown> | string;
     needs_response?: boolean;
+    sequence_number?: number;
   },
 ): Promise<{ id: string; event_type: string }> {
   const res = await apiCall(creds, 'POST', `/api/v1/tasks/${taskId}/events`, event);
