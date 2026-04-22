@@ -97,6 +97,7 @@ interface AgentOptions {
   dispatchGuard?: DispatchGuard;
   tags?: string;
   ownerProject?: string;
+  org?: string;
 }
 
 interface AgentState {
@@ -1077,6 +1078,7 @@ async function runAgent(options: AgentOptions): Promise<void> {
 
   // Auto-detect CV-Hub repository from git remote
   let detectedRepoId: string | undefined;
+  let detectedOwnerSlug: string | undefined;
   try {
     const remoteUrl = execSync('git remote get-url origin 2>/dev/null', {
       cwd: workingDir,
@@ -1090,6 +1092,7 @@ async function runAgent(options: AgentOptions): Promise<void> {
 
     if (cvHubMatch) {
       const [, repoOwner, repoSlug] = cvHubMatch;
+      detectedOwnerSlug = repoOwner;
       try {
         const repoData = await resolveRepoId(creds, repoOwner, repoSlug);
         if (repoData?.id) {
@@ -1102,6 +1105,11 @@ async function runAgent(options: AgentOptions): Promise<void> {
     }
   } catch {
     // Not a git repo or no origin remote — that's fine
+  }
+
+  // CLI --org flag overrides auto-detected owner slug
+  if (options.org) {
+    detectedOwnerSlug = options.org;
   }
 
   // Resolve executor identity metadata
@@ -1156,7 +1164,7 @@ async function runAgent(options: AgentOptions): Promise<void> {
 
   // Register executor
   const executor = await withRetry(
-    () => registerExecutor(creds, machineName, workingDir, detectedRepoId, executorMeta),
+    () => registerExecutor(creds, machineName, workingDir, detectedRepoId, executorMeta, detectedOwnerSlug),
     'Executor registration',
   );
 
@@ -1568,6 +1576,7 @@ export function agentCommand(): Command {
   cmd.option('--dispatch-guard <guard>', 'Dispatch guard: open, confirm, locked (default: open)');
   cmd.option('--tags <tags>', 'Comma-separated tags for this executor');
   cmd.option('--owner-project <project>', 'Project this executor belongs to');
+  cmd.option('--org <slug>', 'Organization slug (auto-detected from repo owner if omitted)');
 
   cmd.action(async (opts: AgentOptions) => {
     await runAgent(opts);

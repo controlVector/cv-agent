@@ -54,6 +54,7 @@ export async function registerExecutor(
   workingDir: string,
   repositoryId?: string,
   metadata?: ExecutorRegistrationMetadata,
+  repoOwnerSlug?: string,
 ): Promise<{ id: string; name: string }> {
   const body: Record<string, unknown> = {
     name: `cva:${machineName}`,
@@ -77,7 +78,34 @@ export async function registerExecutor(
   if (metadata?.owner_project) body.owner_project = metadata.owner_project;
   if (metadata?.integration) body.integration = metadata.integration;
 
-  const res = await apiCall(creds, 'POST', '/api/v1/executors', body);
+  let res = await apiCall(creds, 'POST', '/api/v1/executors', body);
+
+  // Handle multi-org 400: auto-resolve organization_id from repo owner slug
+  if (res.status === 400 && repoOwnerSlug) {
+    try {
+      const errData = await res.json() as {
+        error?: {
+          message?: string;
+          organizations?: Array<{ id: string; slug: string; name: string }>;
+        };
+      };
+
+      const orgs = errData.error?.organizations;
+      if (orgs && orgs.length > 0) {
+        // Match repo owner slug to an org slug
+        const match = orgs.find(
+          (o) => o.slug.toLowerCase() === repoOwnerSlug.toLowerCase()
+        );
+
+        if (match) {
+          body.organization_id = match.id;
+          res = await apiCall(creds, 'POST', '/api/v1/executors', body);
+        }
+      }
+    } catch {
+      // JSON parse failed — fall through to original error
+    }
+  }
 
   if (!res.ok) {
     const err = await res.text();
