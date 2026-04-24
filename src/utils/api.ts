@@ -6,6 +6,7 @@
  */
 
 import type { CVHubCredentials } from './credentials.js';
+import chalk from 'chalk';
 
 // ============================================================================
 // Core API call
@@ -54,8 +55,18 @@ export async function registerExecutor(
   workingDir: string,
   repositoryId?: string,
   metadata?: ExecutorRegistrationMetadata,
-  repoOwnerSlug?: string,
+  orgOptions?: { cliFlag?: string; repoOwnerSlug?: string; cwd?: string },
 ): Promise<{ id: string; name: string }> {
+  const {
+    resolveOrg,
+    resolveToUUID,
+    pickOrg,
+    confirmAutoMatch,
+    promptPersistScope,
+    persistOrg,
+    parseMultiOrgError,
+  } = await import('./org-resolver.js');
+
   const body: Record<string, unknown> = {
     name: `cva:${machineName}`,
     machine_name: machineName,
@@ -78,32 +89,90 @@ export async function registerExecutor(
   if (metadata?.owner_project) body.owner_project = metadata.owner_project;
   if (metadata?.integration) body.integration = metadata.integration;
 
+  // Resolve org from config chain: CLI > env > repo-local > global
+  const resolved = resolveOrg({
+    cliFlag: orgOptions?.cliFlag,
+    cwd: orgOptions?.cwd || workingDir,
+  });
+
+  // If we have a resolved org value, we'll use it on the retry if needed
+  // Don't send it on the first attempt — let the server try its own inference
+  // (from repository_id) first. Only add it if we get the multi-org 400.
+
   let res = await apiCall(creds, 'POST', '/api/v1/executors', body);
 
-  // Handle multi-org 400: auto-resolve organization_id from repo owner slug
-  if (res.status === 400 && repoOwnerSlug) {
-    try {
-      const errData = await res.json() as {
-        error?: {
-          message?: string;
-          organizations?: Array<{ id: string; slug: string; name: string }>;
-        };
-      };
+  // Handle multi-org 400
+  if (res.status === 400) {
+    const errBody = await res.text();
+    const orgs = parseMultiOrgError(res.status, errBody);
 
-      const orgs = errData.error?.organizations;
-      if (orgs && orgs.length > 0) {
-        // Match repo owner slug to an org slug
-        const match = orgs.find(
-          (o) => o.slug.toLowerCase() === repoOwnerSlug.toLowerCase()
-        );
-
-        if (match) {
-          body.organization_id = match.id;
+    if (orgs) {
+      // Strategy 1: Use resolved config value
+      if (resolved.value) {
+        try {
+          const orgId = resolveToUUID(resolved.value, orgs);
+          body.organization_id = orgId;
           res = await apiCall(creds, 'POST', '/api/v1/executors', body);
+        } catch (e: any) {
+          throw new Error(
+            `Organization "${resolved.value}" (from ${resolved.source}) is invalid. ${e.message}`
+          );
         }
       }
-    } catch {
-      // JSON parse failed — fall through to original error
+      // Strategy 2: Auto-match from repo owner slug (requires one-time confirmation)
+      let autoMatchHandled = false;
+      if (!resolved.value && orgOptions?.repoOwnerSlug) {
+        const match = orgs.find(
+          o => o.slug.toLowerCase() === orgOptions.repoOwnerSlug!.toLowerCase()
+        );
+        if (match) {
+          // Non-interactive: fail loud, don't silently register
+          if (!process.stdout.isTTY) {
+            throw new Error(
+              `Auto-matched "${match.slug}" from repo owner, but running non-interactively. ` +
+              `Set CV_HUB_ORG=${match.slug} or pass --org ${match.slug} to confirm, ` +
+              `or pick a different org from: ${orgs.map(o => o.slug).join(', ')}.`
+            );
+          }
+
+          const decision = await confirmAutoMatch(match, orgOptions.repoOwnerSlug);
+
+          if (decision === 'accept') {
+            const scope = await promptPersistScope();
+            if (scope !== 'none') {
+              const savedPath = persistOrg(match.slug, scope, orgOptions?.cwd || workingDir);
+              console.log(chalk.gray(`  Saved to ${savedPath}`));
+            }
+            body.organization_id = match.id;
+            res = await apiCall(creds, 'POST', '/api/v1/executors', body);
+            autoMatchHandled = true;
+          } else if (decision === 'abort') {
+            throw new Error(
+              'Registration aborted. Set CV_HUB_ORG or use --org to choose an org non-interactively.'
+            );
+          }
+          // decision === 'pick' → fall through to Strategy 3
+        }
+      }
+
+      // Strategy 3: Full interactive picker (if nothing above resolved)
+      if (!autoMatchHandled && !res.ok) {
+        const picked = await pickOrg(orgs, {
+          interactive: true,
+          cwd: orgOptions?.cwd || workingDir,
+        });
+
+        if (picked.persistScope !== 'none') {
+          const savedPath = persistOrg(picked.chosen.slug, picked.persistScope, orgOptions?.cwd || workingDir);
+          console.log(chalk.gray(`  Saved to ${savedPath}`));
+        }
+
+        body.organization_id = picked.chosen.id;
+        res = await apiCall(creds, 'POST', '/api/v1/executors', body);
+      }
+    } else {
+      // Not a multi-org error — throw the original error
+      throw new Error(`Failed to register executor: ${res.status} ${errBody}`);
     }
   }
 

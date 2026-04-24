@@ -1164,7 +1164,11 @@ async function runAgent(options: AgentOptions): Promise<void> {
 
   // Register executor
   const executor = await withRetry(
-    () => registerExecutor(creds, machineName, workingDir, detectedRepoId, executorMeta, detectedOwnerSlug),
+    () => registerExecutor(creds, machineName, workingDir, detectedRepoId, executorMeta, {
+      cliFlag: options.org,
+      repoOwnerSlug: detectedOwnerSlug,
+      cwd: workingDir,
+    }),
     'Executor registration',
   );
 
