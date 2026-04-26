@@ -13,6 +13,7 @@ import { authCommand } from './commands/auth.js';
 import { remoteCommand } from './commands/remote.js';
 import { taskCommand } from './commands/task.js';
 import { statusCommand } from './commands/status.js';
+import { orgsCommand } from './commands/orgs.js';
 
 declare const __CVA_VERSION__: string;
 
@@ -29,5 +30,6 @@ program.addCommand(authCommand());
 program.addCommand(remoteCommand());
 program.addCommand(taskCommand());
 program.addCommand(statusCommand());
+program.addCommand(orgsCommand());
 
 program.parse(process.argv);
